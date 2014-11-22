@@ -15,6 +15,8 @@ module Yesod.Auth.Message
     , chineseMessage
     , spanishMessage
     , czechMessage
+    , russianMessage
+    , dutchMessage
     ) where
 
 import Data.Monoid (mappend)
@@ -311,15 +313,14 @@ frenchMessage NowLoggedIn = "Vous êtes maintenant connecté"
 frenchMessage LoginTitle = "Se connecter"
 frenchMessage PleaseProvideUsername = "Merci de renseigner votre nom d'utilisateur"
 frenchMessage PleaseProvidePassword = "Merci de spécifier un mot de passe"
-frenchMessage NoIdentifierProvided = "No email/username provided"
-frenchMessage InvalidEmailAddress = "Invalid email address provided"
-frenchMessage PasswordResetTitle = "Password Reset"
-frenchMessage ProvideIdentifier = "Email or Username"
-frenchMessage SendPasswordResetEmail = "Send password reset email"
-frenchMessage PasswordResetPrompt = "Enter your e-mail address or username below, and a password reset e-mail will be sent to you."
-frenchMessage InvalidUsernamePass = "Invalid username/password combination"
--- TODO
-frenchMessage i@(IdentifierNotFound _) = englishMessage i
+frenchMessage NoIdentifierProvided = "Adresse électronique/nom d'utilisateur non spécifié"
+frenchMessage InvalidEmailAddress = "Adresse électronique spécifiée invalide"
+frenchMessage PasswordResetTitle = "Réinitialisation de mot de passe"
+frenchMessage ProvideIdentifier = "Adresse électronique ou nom d'utilisateur"
+frenchMessage SendPasswordResetEmail = "Envoie d'un message électronique pour Réinitialisation le mot de passe"
+frenchMessage PasswordResetPrompt = "Entrez votre adresse électronique ou votre nom d'utilisateur ci-dessous, et un message électronique de réinitialisation de mot de passe vous sera envoyé."
+frenchMessage InvalidUsernamePass = "Le couble nom d'utilisateur/mot de passe invalide"
+frenchMessage (IdentifierNotFound ident) = "Nom d'utilisateur introuvable: " `mappend` ident
 
 norwegianBokmålMessage :: AuthMessage -> Text
 norwegianBokmålMessage NoOpenID = "Ingen OpenID-identifiserer funnet"
@@ -397,15 +398,15 @@ japaneseMessage NowLoggedIn = "ログインしました"
 japaneseMessage LoginTitle = "ログイン"
 japaneseMessage PleaseProvideUsername = "ユーザ名を入力してください"
 japaneseMessage PleaseProvidePassword = "パスワードを入力してください"
-japaneseMessage NoIdentifierProvided = "No email/username provided"
-japaneseMessage InvalidEmailAddress = "Invalid email address provided"
-japaneseMessage PasswordResetTitle = "Password Reset"
-japaneseMessage ProvideIdentifier = "Email or Username"
-japaneseMessage SendPasswordResetEmail = "Send password reset email"
-japaneseMessage PasswordResetPrompt = "Enter your e-mail address or username below, and a password reset e-mail will be sent to you."
-japaneseMessage InvalidUsernamePass = "Invalid username/password combination"
+japaneseMessage NoIdentifierProvided = "メールアドレス/ユーザ名が入力されていません"
+japaneseMessage InvalidEmailAddress = "メールアドレスが無効です"
+japaneseMessage PasswordResetTitle = "パスワードの再設定"
+japaneseMessage ProvideIdentifier = "メールアドレスまたはユーザ名"
+japaneseMessage SendPasswordResetEmail = "パスワード再設定用メールの送信"
+japaneseMessage PasswordResetPrompt = "以下にメールアドレスまたはユーザ名を入力してください。パスワードを再設定するためのメールが送信されます。"
+japaneseMessage InvalidUsernamePass = "ユーザ名とパスワードの組み合わせが間違っています"
 japaneseMessage (IdentifierNotFound ident) =
-  "「" `mappend` ident `mappend` "」は正しくないログインので、または未入力の項目があります。"
+  ident `mappend` "は登録されていません"
 
 finnishMessage :: AuthMessage -> Text
 finnishMessage NoOpenID = "OpenID-tunnistetta ei löydy"
@@ -534,3 +535,89 @@ czechMessage PasswordResetPrompt = "Zadejte svou e-mailovou adresu nebo uživate
 czechMessage InvalidUsernamePass = "Neplatná kombinace uživatelského jména a hesla"
 -- TODO
 czechMessage i@(IdentifierNotFound _) = englishMessage i
+
+-- Так как e-mail – это фактическое сокращение словосочетания electronic mail,
+-- для русского перевода так же использовано сокращение: эл.почта
+russianMessage :: AuthMessage -> Text
+russianMessage NoOpenID = "Идентификатор OpenID не найден"
+russianMessage LoginOpenID = "Вход с помощью OpenID"
+russianMessage LoginGoogle = "Вход с помощью Google"
+russianMessage LoginYahoo = "Вход с помощью Yahoo"
+russianMessage Email = "Эл.почта"
+russianMessage Password = "Пароль"
+russianMessage Register = "Регистрация"
+russianMessage RegisterLong = "Создать учётную запись"
+russianMessage EnterEmail = "Введите свой адрес эл.почты ниже, вам будет отправлено письмо для подтверждения."
+russianMessage ConfirmationEmailSentTitle = "Письмо для подтверждения отправлено"
+russianMessage (ConfirmationEmailSent email) =
+    "Письмо для подтверждения было отправлено на адрес " `mappend`
+    email `mappend`
+    "."
+russianMessage AddressVerified = "Адрес подтверждён. Пожалуйста, установите новый пароль."
+russianMessage InvalidKeyTitle = "Неверный ключ подтверждения"
+russianMessage InvalidKey = "Извините, но ключ подтверждения оказался недействительным."
+russianMessage InvalidEmailPass = "Неверное сочетание эл.почты и пароля"
+russianMessage BadSetPass = "Чтобы изменить пароль, необходимо выполнить вход"
+russianMessage SetPassTitle = "Установить пароль"
+russianMessage SetPass = "Установить новый пароль"
+russianMessage NewPass = "Новый пароль"
+russianMessage ConfirmPass = "Подтверждение"
+russianMessage PassMismatch = "Пароли не совпадают, повторите снова"
+russianMessage PassUpdated = "Пароль обновлён"
+russianMessage Facebook = "Вход с помощью Facebook"
+russianMessage LoginViaEmail = "Вход по адресу эл.почты"
+russianMessage InvalidLogin = "Неверный логин"
+russianMessage NowLoggedIn = "Вход выполнен"
+russianMessage LoginTitle = "Вход"
+russianMessage PleaseProvideUsername = "Пожалуйста, введите ваше имя пользователя"
+russianMessage PleaseProvidePassword = "Пожалуйста, введите ваш пароль"
+russianMessage NoIdentifierProvided = "Не указан адрес эл.почты/имя пользователя"
+russianMessage InvalidEmailAddress = "Указан неверный адрес эл.почты"
+russianMessage PasswordResetTitle = "Сброс пароля"
+russianMessage ProvideIdentifier = "Имя пользователя или эл.почта"
+russianMessage SendPasswordResetEmail = "Отправить письмо для сброса пароля"
+russianMessage PasswordResetPrompt = "Введите адрес эл.почты или ваше имя пользователя ниже, вам будет отправлено письмо для сброса пароля."
+russianMessage InvalidUsernamePass = "Неверное сочетание имени пользователя и пароля"
+russianMessage (IdentifierNotFound ident) = "Логин не найден: " `mappend` ident
+
+dutchMessage :: AuthMessage -> Text
+dutchMessage NoOpenID = "Geen OpenID identificator gevonden"
+dutchMessage LoginOpenID = "Inloggen via OpenID"
+dutchMessage LoginGoogle = "Inloggen via Google"
+dutchMessage LoginYahoo = "Inloggen via Yahoo"
+dutchMessage Email = "E-mail"
+dutchMessage Password = "Wachtwoord"
+dutchMessage Register = "Registreren"
+dutchMessage RegisterLong = "Registreer een nieuw account"
+dutchMessage EnterEmail = "Voer uw e-mailadres hieronder in, er zal een bevestigings-e-mail naar u worden verzonden."
+dutchMessage ConfirmationEmailSentTitle = "Bevestigings-e-mail verzonden"
+dutchMessage (ConfirmationEmailSent email) =
+    "Een bevestigings-e-mail is verzonden naar " `mappend`
+    email `mappend`
+    "."
+dutchMessage AddressVerified = "Adres geverifieerd, stel alstublieft een nieuwe wachtwoord in"
+dutchMessage InvalidKeyTitle = "Ongeldig verificatietoken"
+dutchMessage InvalidKey = "Dat was helaas een ongeldig verificatietoken."
+dutchMessage InvalidEmailPass = "Ongeldige e-mailadres/wachtwoord combinatie"
+dutchMessage BadSetPass = "U moet ingelogd zijn om een nieuwe wachtwoord in te stellen"
+dutchMessage SetPassTitle = "Wachtwoord instellen"
+dutchMessage SetPass = "Een nieuwe wachtwoord instellen"
+dutchMessage NewPass = "Nieuw wachtwoord"
+dutchMessage ConfirmPass = "Bevestig"
+dutchMessage PassMismatch = "Wachtwoorden kwamen niet overeen, probeer het alstublieft nog eens"
+dutchMessage PassUpdated = "Wachtwoord geüpdatet"
+dutchMessage Facebook = "Inloggen met Facebook"
+dutchMessage LoginViaEmail = "Inloggen via e-mail"
+dutchMessage InvalidLogin = "Ongeldige inloggegevens"
+dutchMessage NowLoggedIn = "U bent nu ingelogd"
+dutchMessage LoginTitle = "Inloggen"
+dutchMessage PleaseProvideUsername = "Voer alstublieft uw gebruikersnaam in"
+dutchMessage PleaseProvidePassword = "Voer alstublieft uw wachtwoord in"
+dutchMessage NoIdentifierProvided = "Geen e-mailadres/gebruikersnaam opgegeven"
+dutchMessage InvalidEmailAddress = "Ongeldig e-mailadres opgegeven"
+dutchMessage PasswordResetTitle = "Wachtwoord wijzigen"
+dutchMessage ProvideIdentifier = "E-mailadres of gebruikersnaam"
+dutchMessage SendPasswordResetEmail = "Stuur een wachtwoord reset e-mail"
+dutchMessage PasswordResetPrompt = "Voer uw e-mailadres of gebruikersnaam hieronder in, er zal een e-mail naar u worden verzonden waarmee u uw wachtwoord kunt wijzigen."
+dutchMessage InvalidUsernamePass = "Ongeldige gebruikersnaam/wachtwoord combinatie"
+dutchMessage (IdentifierNotFound ident) = "Inloggegevens niet gevonden: " `mappend` ident

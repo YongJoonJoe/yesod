@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes, TypeFamilies, TemplateHaskell, MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleInstances, ViewPatterns #-}
+{-# LANGUAGE CPP #-}
 module YesodCoreTest.CleanPath (cleanPathTest, Widget) where
 
 import Test.Hspec
@@ -32,7 +33,7 @@ instance ParseRoute Subsite where
     parseRoute (x, _) = Just $ SubsiteRoute x
 
 instance YesodSubDispatch Subsite master where
-    yesodSubDispatch _ req = return $ responseLBS
+    yesodSubDispatch _ req f = f $ responseLBS
         status200
         [ ("Content-Type", "SUBSITE")
         ] $ L8.pack $ show (pathInfo req)

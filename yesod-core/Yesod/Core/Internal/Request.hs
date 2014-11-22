@@ -23,7 +23,6 @@ import Data.String (IsString)
 import Control.Arrow (second)
 import qualified Network.Wai.Parse as NWP
 import qualified Network.Wai as W
-import System.Random (RandomGen, randomRs)
 import Web.Cookie (parseCookiesText)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as S8
@@ -33,35 +32,41 @@ import Data.Maybe (fromMaybe, catMaybes)
 import qualified Data.ByteString.Lazy as L
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import Data.Text.Encoding (decodeUtf8With)
+import Data.Text.Encoding (decodeUtf8With, decodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Conduit
 import Data.Conduit.List (sourceList)
 import Data.Conduit.Binary (sourceFile, sinkFile)
 import Data.Word (Word64)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Resource (runResourceT, ResourceT)
 import Control.Exception (throwIO)
+import Control.Monad ((<=<), liftM)
 import Yesod.Core.Types
 import qualified Data.Map as Map
+import Data.IORef
+import qualified System.Random.MWC as MWC
+import Control.Monad.Primitive (PrimMonad, PrimState)
+import qualified Data.Vector.Storable as V
+import Data.Word (Word8)
+import Data.ByteString.Internal (ByteString (PS))
+import qualified Data.Word8 as Word8
 
 -- | Impose a limit on the size of the request body.
-limitRequestBody :: Word64 -> W.Request -> W.Request
-limitRequestBody maxLen req =
-    req { W.requestBody = W.requestBody req $= limit maxLen }
-  where
-    tooLarge = liftIO $ throwIO $ HCWai tooLargeResponse
-
-    limit 0 = tooLarge
-    limit remaining =
-        await >>= maybe (return ()) go
-      where
-        go bs = do
+limitRequestBody :: Word64 -> W.Request -> IO W.Request
+limitRequestBody maxLen req = do
+    ref <- newIORef maxLen
+    return req
+        { W.requestBody = do
+            bs <- W.requestBody req
+            remaining <- readIORef ref
             let len = fromIntegral $ S8.length bs
-            if len > remaining
-                then tooLarge
+                remaining' = remaining - len
+            if remaining < len
+                then throwIO $ HCWai tooLargeResponse
                 else do
-                    yield bs
-                    limit $ remaining - len
+                    writeIORef ref remaining'
+                    return bs
+        }
 
 tooLargeResponse :: W.Response
 tooLargeResponse = W.responseLBS
@@ -69,12 +74,11 @@ tooLargeResponse = W.responseLBS
     [("Content-Type", "text/plain")]
     "Request body too large to be processed."
 
-parseWaiRequest :: RandomGen g
-                => W.Request
+parseWaiRequest :: W.Request
                 -> SessionMap
                 -> Bool
                 -> Maybe Word64 -- ^ max body size
-                -> (Either YesodRequest (g -> YesodRequest))
+                -> (Either (IO YesodRequest) (MWC.GenIO -> IO YesodRequest))
 parseWaiRequest env session useToken mmaxBodySize =
     -- In most cases, we won't need to generate any random values. Therefore,
     -- we split our results: if we need a random generator, return a Right
@@ -82,19 +86,21 @@ parseWaiRequest env session useToken mmaxBodySize =
     -- acquisition.
     case etoken of
         Left token -> Left $ mkRequest token
-        Right mkToken -> Right $ mkRequest . mkToken
+        Right mkToken -> Right $ mkRequest <=< mkToken
   where
-    mkRequest token' = YesodRequest
-        { reqGetParams  = gets
-        , reqCookies    = cookies
-        , reqWaiRequest = maybe id limitRequestBody mmaxBodySize env
-        , reqLangs      = langs''
-        , reqToken      = token'
-        , reqSession    = if useToken
-                            then Map.delete tokenKey session
-                            else session
-        , reqAccept     = httpAccept env
-        }
+    mkRequest token' = do
+        envLimited <- maybe return limitRequestBody mmaxBodySize env
+        return YesodRequest
+            { reqGetParams  = gets
+            , reqCookies    = cookies
+            , reqWaiRequest = envLimited
+            , reqLangs      = langs''
+            , reqToken      = token'
+            , reqSession    = if useToken
+                                then Map.delete tokenKey session
+                                else session
+            , reqAccept     = httpAccept env
+            }
     gets = textQueryString env
     reqCookie = lookup "Cookie" $ W.requestHeaders env
     cookies = maybe [] parseCookiesText reqCookie
@@ -123,7 +129,7 @@ parseWaiRequest env session useToken mmaxBodySize =
                 -- Already have a token, use it.
                 Just bs -> Left $ Just $ decodeUtf8With lenientDecode bs
                 -- Don't have a token, get a random generator and make a new one.
-                Nothing -> Right $ Just . pack . randomString 10
+                Nothing -> Right $ fmap Just . randomString 10
         | otherwise = Left Nothing
 
 textQueryString :: W.Request -> [(Text, Text)]
@@ -152,13 +158,23 @@ addTwoLetters (toAdd, exist) (l:ls) =
 -- | Generate a random String of alphanumerical characters
 -- (a-z, A-Z, and 0-9) of the given length using the given
 -- random number generator.
-randomString :: RandomGen g => Int -> g -> String
-randomString len = take len . map toChar . randomRs (0, 61)
+randomString :: PrimMonad m => Int -> MWC.Gen (PrimState m) -> m Text
+randomString len gen =
+    liftM (decodeUtf8 . fromByteVector) $ V.replicateM len asciiChar
   where
-    toChar i
-        | i < 26 = toEnum $ i + fromEnum 'A'
-        | i < 52 = toEnum $ i + fromEnum 'a' - 26
-        | otherwise = toEnum $ i + fromEnum '0' - 52
+    asciiChar = liftM toAscii $ MWC.uniformR (0, 61) gen
+
+    toAscii i
+        | i < 26 = i + Word8._A
+        | i < 52 = i + Word8._a - 26
+        | otherwise = i + Word8._0 - 52
+
+fromByteVector :: V.Vector Word8 -> ByteString
+fromByteVector v =
+    PS fptr offset idx
+  where
+    (fptr, offset, idx) = V.unsafeToForeignPtr v
+{-# INLINE fromByteVector #-}
 
 mkFileInfoLBS :: Text -> Text -> L.ByteString -> FileInfo
 mkFileInfoLBS name ct lbs = FileInfo name ct (sourceList $ L.toChunks lbs) (\fp -> L.writeFile fp lbs)

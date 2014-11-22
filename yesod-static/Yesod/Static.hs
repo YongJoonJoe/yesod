@@ -66,6 +66,7 @@ import System.Directory
 import Control.Monad
 import Data.FileEmbed (embedDir)
 
+import Control.Monad.Trans.Resource (runResourceT)
 import Yesod.Core
 import Yesod.Core.Types
 
@@ -73,14 +74,14 @@ import Data.List (intercalate)
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax as TH
 
-import Crypto.Conduit (hashFile, sinkHash)
-import Crypto.Hash.CryptoAPI (MD5)
+import Crypto.Hash.Conduit (hashFile, sinkHash)
+import Crypto.Hash (MD5, Digest)
 import Control.Monad.Trans.State
 
+import qualified Data.Byteable as Byteable
 import qualified Data.ByteString.Base64
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as L
-import qualified Data.Serialize
 import Data.Text (Text, pack)
 import qualified Data.Text as T
 import qualified Data.Map as M
@@ -246,7 +247,7 @@ staticFiles dir = mkStaticFiles dir
 -- files, but only need to refer to a few of them from Haskell.
 staticFilesList :: Prelude.FilePath -> [Prelude.FilePath] -> Q [Dec]
 staticFilesList dir fs =
-    mkStaticFilesList dir (map split fs) "StaticRoute" True
+    mkStaticFilesList dir (map split fs) True
   where
     split :: Prelude.FilePath -> [String]
     split [] = []
@@ -265,7 +266,7 @@ staticFilesList dir fs =
 -- contents, however they'll need send a request to the server to
 -- see if their copy is up-to-date.
 publicFiles :: Prelude.FilePath -> Q [Dec]
-publicFiles dir = mkStaticFiles' dir "StaticRoute" False
+publicFiles dir = mkStaticFiles' dir False
 
 
 mkHashMap :: Prelude.FilePath -> IO (M.Map F.FilePath S8.ByteString)
@@ -310,23 +311,21 @@ cachedETagLookup dir = do
     return $ (\f -> return $ M.lookup f etags)
 
 mkStaticFiles :: Prelude.FilePath -> Q [Dec]
-mkStaticFiles fp = mkStaticFiles' fp "StaticRoute" True
+mkStaticFiles fp = mkStaticFiles' fp True
 
 mkStaticFiles' :: Prelude.FilePath -- ^ static directory
-               -> String   -- ^ route constructor "StaticRoute"
                -> Bool     -- ^ append checksum query parameter
                -> Q [Dec]
-mkStaticFiles' fp routeConName makeHash = do
+mkStaticFiles' fp makeHash = do
     fs <- qRunIO $ getFileListPieces fp
-    mkStaticFilesList fp fs routeConName makeHash
+    mkStaticFilesList fp fs makeHash
 
 mkStaticFilesList
     :: Prelude.FilePath -- ^ static directory
     -> [[String]] -- ^ list of files to create identifiers for
-    -> String   -- ^ route constructor "StaticRoute"
     -> Bool     -- ^ append checksum query parameter
     -> Q [Dec]
-mkStaticFilesList fp fs routeConName makeHash = do
+mkStaticFilesList fp fs makeHash = do
     concat `fmap` mapM mkRoute fs
   where
     replace' c
@@ -344,22 +343,21 @@ mkStaticFilesList fp fs routeConName makeHash = do
                         | isLower (head name') -> name'
                         | otherwise -> '_' : name'
         f' <- [|map pack $(TH.lift f)|]
-        let route = mkName routeConName
         pack' <- [|pack|]
         qs <- if makeHash
                     then do hash <- qRunIO $ base64md5File $ pathFromRawPieces fp f
                             [|[(pack "etag", pack $(TH.lift hash))]|]
                     else return $ ListE []
         return
-            [ SigD routeName $ ConT route
+            [ SigD routeName $ ConT ''StaticRoute
             , FunD routeName
-                [ Clause [] (NormalB $ (ConE route) `AppE` f' `AppE` qs) []
+                [ Clause [] (NormalB $ (ConE 'StaticRoute) `AppE` f' `AppE` qs) []
                 ]
             ]
 
 base64md5File :: Prelude.FilePath -> IO String
 base64md5File = fmap (base64 . encode) . hashFile
-    where encode d = Data.Serialize.encode (d :: MD5)
+    where encode d = Byteable.toBytes (d :: Digest MD5)
 
 base64md5 :: L.ByteString -> String
 base64md5 lbs =
@@ -367,7 +365,7 @@ base64md5 lbs =
           $ runIdentity
           $ sourceList (L.toChunks lbs) $$ sinkHash
   where
-    encode d = Data.Serialize.encode (d :: MD5)
+    encode d = Byteable.toBytes (d :: Digest MD5)
 
 base64 :: S.ByteString -> String
 base64 = map tr
@@ -446,7 +444,7 @@ data CombineSettings = CombineSettings
     , csCssPostProcess :: [FilePath] -> L.ByteString -> IO L.ByteString
     -- ^ Post processing to be performed on CSS files.
     --
-    -- Default: Use Lucius to minify.
+    -- Default: Pass-through.
     --
     -- Since 1.2.0
     , csJsPostProcess :: [FilePath] -> L.ByteString -> IO L.ByteString

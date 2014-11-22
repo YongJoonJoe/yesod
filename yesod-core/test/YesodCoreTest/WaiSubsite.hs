@@ -1,4 +1,4 @@
-{-# LANGUAGE QuasiQuotes, TemplateHaskell, TypeFamilies, MultiParamTypeClasses, OverloadedStrings #-}
+{-# LANGUAGE CPP, QuasiQuotes, TemplateHaskell, TypeFamilies, MultiParamTypeClasses, OverloadedStrings #-}
 module YesodCoreTest.WaiSubsite (specs, Widget) where
 
 import YesodCoreTest.YesodTest
@@ -6,7 +6,7 @@ import Yesod.Core
 import qualified Network.HTTP.Types as H
 
 myApp :: Application
-myApp _ = return $ responseLBS H.status200 [("Content-type", "text/plain")] "WAI"
+myApp _ f = f $ responseLBS H.status200 [("Content-type", "text/plain")] "WAI"
 
 getApp :: a -> WaiSubsite
 getApp _ = WaiSubsite myApp

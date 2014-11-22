@@ -106,12 +106,18 @@ prodEmbed e = do
                  }
     return $ ComputedEntry (ebHaskellName e) st link
 
+toApp :: (Request -> IO Response) -> Application
+toApp f req g = f req >>= g
+
 tryExtraDevelFiles :: [[T.Text] -> IO (Maybe (MimeType, BL.ByteString))] -> Application
-tryExtraDevelFiles [] _ = return $ responseLBS status404 [] ""
-tryExtraDevelFiles (f:fs) r = do
+tryExtraDevelFiles = toApp . tryExtraDevelFiles'
+
+tryExtraDevelFiles' :: [[T.Text] -> IO (Maybe (MimeType, BL.ByteString))] -> Request -> IO Response
+tryExtraDevelFiles' [] _ = return $ responseLBS status404 [] ""
+tryExtraDevelFiles' (f:fs) r = do
     mct <- liftIO $ f $ drop 1 $ pathInfo r -- drop the initial "res"
     case mct of
-        Nothing -> tryExtraDevelFiles fs r
+        Nothing -> tryExtraDevelFiles' fs r
         Just (mime, ct) -> do
             let hash = T.encodeUtf8 $ T.pack $ base64md5 ct
             let headers = [ ("Content-Type", mime)
@@ -123,11 +129,11 @@ tryExtraDevelFiles (f:fs) r = do
 
 -- | Helper to create the development application at runtime
 develApp :: StaticSettings -> [[T.Text] -> IO (Maybe (MimeType, BL.ByteString))] -> Application
-develApp settings extra req = do
-    resp <- staticApp settings {ssMaxAge = NoMaxAge} req
-    if statusCode (responseStatus resp) == 404
-        then tryExtraDevelFiles extra req
-        else return resp
+develApp settings extra req sendResponse = do
+    staticApp settings {ssMaxAge = NoMaxAge} req $ \resp ->
+        if statusCode (responseStatus resp) == 404
+            then tryExtraDevelFiles extra req sendResponse
+            else sendResponse resp
 
 -- | The type of 'addStaticContent'
 type AddStaticContent site = T.Text -> T.Text -> BL.ByteString

@@ -13,14 +13,12 @@ import qualified Data.ByteString.Char8        as S8
 import           Data.CaseInsensitive         (CI)
 import qualified Data.CaseInsensitive         as CI
 import           Network.Wai
-#if MIN_VERSION_wai(2, 0, 0)
 import           Data.Conduit                 (transPipe)
-import           Control.Monad.Trans.Resource (runInternalState, getInternalState, runResourceT, InternalState, closeInternalState)
-import           Control.Monad.Trans.Class    (lift)
+import           Control.Monad.Trans.Resource (runInternalState, InternalState)
 import           Network.Wai.Internal
-import           Control.Exception            (finally)
-#endif
+#if !MIN_VERSION_base(4, 6, 0)
 import           Prelude                      hiding (catch)
+#endif
 import           Web.Cookie                   (renderSetCookie)
 import           Yesod.Core.Content
 import           Yesod.Core.Types
@@ -33,31 +31,19 @@ import qualified Data.ByteString.Lazy         as L
 import qualified Data.Map                     as Map
 import           Yesod.Core.Internal.Request  (tokenKey)
 import           Data.Text.Encoding           (encodeUtf8)
+import           Data.Conduit                 (Flush (..), ($$))
+import qualified Data.Conduit.List            as CL
 
 yarToResponse :: YesodResponse
               -> (SessionMap -> IO [Header]) -- ^ save session
               -> YesodRequest
               -> Request
-#if MIN_VERSION_wai(2, 0, 0)
               -> InternalState
-#endif
-              -> IO Response
-#if MIN_VERSION_wai(2, 0, 0)
-yarToResponse (YRWai a) _ _ _ is =
-    case a of
-        ResponseSource s hs w -> return $ ResponseSource s hs $ \f ->
-            w f `finally` closeInternalState is
-        _ -> do
-            closeInternalState is
-            return a
-#else
-yarToResponse (YRWai a) _ _ _ = return a
-#endif
-yarToResponse (YRPlain s' hs ct c newSess) saveSession yreq req
-#if MIN_VERSION_wai(2, 0, 0)
-  is
-#endif
-  = do
+              -> (Response -> IO ResponseReceived)
+              -> IO ResponseReceived
+yarToResponse (YRWai a) _ _ _ _ sendResponse = sendResponse a
+yarToResponse (YRWaiApp app) _ _ req _ sendResponse = app req sendResponse
+yarToResponse (YRPlain s' hs ct c newSess) saveSession yreq _req is sendResponse = do
     extraHeaders <- do
         let nsToken = maybe
                 newSess
@@ -69,28 +55,20 @@ yarToResponse (YRPlain s' hs ct c newSess) saveSession yreq req
         finalHeaders' len = ("Content-Length", S8.pack $ show len)
                           : finalHeaders
 
-#if MIN_VERSION_wai(2, 0, 0)
     let go (ContentBuilder b mlen) = do
             let hs' = maybe finalHeaders finalHeaders' mlen
-            closeInternalState is
-            return $ ResponseBuilder s hs' b
+            sendResponse $ ResponseBuilder s hs' b
         go (ContentFile fp p) = do
-            closeInternalState is
-            return $ ResponseFile s finalHeaders fp p
-        go (ContentSource body) = return $ ResponseSource s finalHeaders $ \f ->
-            f (transPipe (flip runInternalState is) body) `finally`
-            closeInternalState is
+            sendResponse $ ResponseFile s finalHeaders fp p
+        go (ContentSource body) = sendResponse $ responseStream s finalHeaders
+            $ \sendChunk flush -> do
+                transPipe (flip runInternalState is) body
+                $$ CL.mapM_ (\mchunk ->
+                    case mchunk of
+                        Flush -> flush
+                        Chunk builder -> sendChunk builder)
         go (ContentDontEvaluate c') = go c'
     go c
-#else
-    let go (ContentBuilder b mlen) =
-            let hs' = maybe finalHeaders finalHeaders' mlen
-             in ResponseBuilder s hs' b
-        go (ContentFile fp p) = ResponseFile s finalHeaders fp p
-        go (ContentSource body) = ResponseSource s finalHeaders body
-        go (ContentDontEvaluate c') = go c'
-    return $ go c
-#endif
   where
     s
         | s' == defaultStatus = H.status200
@@ -128,7 +106,9 @@ headerToPair (Header key value) = (CI.mk key, value)
 evaluateContent :: Content -> IO (Either ErrorResponse Content)
 evaluateContent (ContentBuilder b mlen) = handle f $ do
     let lbs = toLazyByteString b
-    L.length lbs `seq` return (Right $ ContentBuilder (fromLazyByteString lbs) mlen)
+        len = L.length lbs
+        mlen' = maybe (Just $ fromIntegral len) Just mlen
+    len `seq` return (Right $ ContentBuilder (fromLazyByteString lbs) mlen')
   where
     f :: SomeException -> IO (Either ErrorResponse Content)
     f = return . Left . InternalError . T.pack . show

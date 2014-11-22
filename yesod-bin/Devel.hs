@@ -64,23 +64,17 @@ import           GhcBuild                              (buildPackage,
                                                         getBuildFlags, getPackageArgs)
 
 import qualified Config                                as GHC
-import           Data.Conduit.Network                  (HostPreference (HostIPv4),
-                                                        bindPort)
+import           Data.Streaming.Network                (bindPortTCP)
 import           Network                               (withSocketsDo)
-#if MIN_VERSION_http_conduit(2, 0, 0)
 import           Network.HTTP.Conduit                  (conduitManagerSettings, newManager)
 import           Data.Default.Class                    (def)
-#else
-import           Network.HTTP.Conduit                  (def, newManager)
-#endif
 import           Network.HTTP.ReverseProxy             (ProxyDest (ProxyDest),
                                                         waiProxyToSettings, wpsTimeout, wpsOnExc)
-#if MIN_VERSION_http_reverse_proxy(0, 2, 0)
 import qualified Network.HTTP.ReverseProxy             as ReverseProxy
-#endif
-import           Network.HTTP.Types                    (status200)
+import           Network.HTTP.Types                    (status200, status503)
 import           Network.Socket                        (sClose)
-import           Network.Wai                           (responseLBS)
+import           Network.Wai                           (responseLBS, requestHeaders)
+import           Network.Wai.Parse                     (parseHttpAccept)
 import           Network.Wai.Handler.Warp              (run)
 import           SrcLoc                                (Located)
 import           Data.FileEmbed        (embedFile)
@@ -130,31 +124,30 @@ cabalProgram opts | isCabalDev opts = "cabal-dev"
 -- 3001, give an appropriate message to the user.
 reverseProxy :: DevelOpts -> I.IORef Int -> IO ()
 reverseProxy opts iappPort = do
-#if MIN_VERSION_http_conduit(2, 0, 0)
     manager <- newManager conduitManagerSettings
-#else
-    manager <- newManager def
-#endif
     let refreshHtml = LB.fromChunks $ return $(embedFile "refreshing.html")
-    let onExc _ _ = return $ responseLBS status200
-            [ ("content-type", "text/html")
-            , ("Refresh", "1")
-            ]
-            refreshHtml
+    let onExc _ req
+            | maybe False (("application/json" `elem`) . parseHttpAccept)
+                (lookup "accept" $ requestHeaders req) =
+                    return $ responseLBS status503
+                        [ ("Retry-After", "1")
+                        ]
+                        "{\"message\":\"Recompiling\"}"
+            | otherwise = return $ responseLBS status200
+                [ ("content-type", "text/html")
+                , ("Refresh", "1")
+                ]
+                refreshHtml
 
     let runProxy =
             run (develPort opts) $ waiProxyToSettings
                 (const $ do
                     appPort <- liftIO $ I.readIORef iappPort
                     return $
-#if MIN_VERSION_http_reverse_proxy(0, 2, 0)
                         ReverseProxy.WPRProxyDest
-#else
-                        Right
-#endif
                         $ ProxyDest "127.0.0.1" appPort)
                 def
-                    { wpsOnExc = onExc
+                    { wpsOnExc = \e req f -> onExc e req >>= f
                     , wpsTimeout =
                         if proxyTimeout opts == 0
                             then Nothing
@@ -171,7 +164,7 @@ reverseProxy opts iappPort = do
 
 checkPort :: Int -> IO Bool
 checkPort p = do
-    es <- Ex.try $ bindPort p HostIPv4
+    es <- Ex.try $ bindPortTCP p "*4"
     case es of
         Left (_ :: Ex.IOException) -> return False
         Right s -> do
@@ -195,7 +188,7 @@ devel opts passThroughArgs = withSocketsDo $ withManager $ \manager -> do
     unlessM (checkPort $ develPort opts) $ error "devel port unavailable"
     iappPort <- getPort opts 17834 >>= I.newIORef
     when (useReverseProxy opts) $ void $ forkIO $ reverseProxy opts iappPort
-    checkDevelFile
+    develHsPath <- checkDevelFile
     writeLock opts
 
     let (terminator, after) = case terminateWith opts of
@@ -208,8 +201,9 @@ devel opts passThroughArgs = withSocketsDo $ withManager $ \manager -> do
     putStrLn $ "Yesod devel server. "  ++ terminator ++ " to quit"
     void $ forkIO $ do
       filesModified <- newEmptyMVar
-      watchTree manager "." (const True) (\_ -> void (tryPutMVar filesModified ()))
-      evalStateT (mainOuterLoop iappPort filesModified) Map.empty
+      void $ forkIO $
+        void $ watchTree manager "." (const True) (\_ -> void (tryPutMVar filesModified ()))
+      evalStateT (mainOuterLoop develHsPath iappPort filesModified) Map.empty
     after
     writeLock opts
     exitSuccess
@@ -217,7 +211,7 @@ devel opts passThroughArgs = withSocketsDo $ withManager $ \manager -> do
     bd = getBuildDir opts
 
     -- outer loop re-reads the cabal file
-    mainOuterLoop iappPort filesModified = do
+    mainOuterLoop develHsPath iappPort filesModified = do
       ghcVer <- liftIO ghcVersion
       cabal  <- liftIO $ D.findPackageDesc "."
       gpd    <- liftIO $ D.readPackageDescription D.normal cabal
@@ -233,20 +227,20 @@ devel opts passThroughArgs = withSocketsDo $ withManager $ \manager -> do
                                                , "yesod-devel/ldargs.txt"
                                                ]
              rebuild <- liftIO $ mkRebuild ghcVer cabal opts ldar
-             mainInnerLoop iappPort hsSourceDirs filesModified cabal rebuild
+             mainInnerLoop develHsPath iappPort hsSourceDirs filesModified cabal rebuild
            else do
              liftIO (threadDelay 5000000)
-             mainOuterLoop iappPort filesModified
+             mainOuterLoop develHsPath iappPort filesModified
 
     -- inner loop rebuilds after files change
-    mainInnerLoop iappPort hsSourceDirs filesModified cabal rebuild = go
+    mainInnerLoop develHsPath iappPort hsSourceDirs filesModified cabal rebuild = go
        where
          go = do
            _ <- recompDeps hsSourceDirs
            list <- liftIO $ getFileList hsSourceDirs [cabal]
            success <- liftIO rebuild
            pkgArgs <- liftIO (ghcPackageArgs opts)
-           let devArgs = pkgArgs ++ ["devel.hs"]
+           let devArgs = pkgArgs ++ [develHsPath]
            let loop list0 = do
                    (haskellFileChanged, list1) <- liftIO $
                        watchForChanges filesModified hsSourceDirs [cabal] list0 (eventTimeout opts)
@@ -254,7 +248,7 @@ devel opts passThroughArgs = withSocketsDo $ withManager $ \manager -> do
                    unless (anyTouched || haskellFileChanged) $ loop list1
            if not success
              then liftIO $ do
-                   putStrLn "Build failure, pausing..."
+                   putStrLn "\x1b[1;31mBuild failure, pausing...\x1b[0m"
                    runBuildHook $ failHook opts
              else do
                    liftIO $ runBuildHook $ successHook opts
@@ -269,7 +263,10 @@ devel opts passThroughArgs = withSocketsDo $ withManager $ \manager -> do
                    liftIO $ I.writeIORef iappPort appPort
 
                    (_,_,_,ph) <- liftIO $ createProcess (proc "runghc" devArgs)
-                        { env = Just $ ("PORT", show appPort) : ("DISPLAY_PORT", show $ develPort opts) : env0
+                        { env = Just $ Map.toList
+                                     $ Map.insert "PORT" (show appPort)
+                                     $ Map.insert "DISPLAY_PORT" (show $ develPort opts)
+                                     $ Map.fromList env0
                         }
                    derefMap <- get
                    watchTid <- liftIO . forkIO . try_ $ flip evalStateT derefMap $ do
@@ -285,7 +282,7 @@ devel opts passThroughArgs = withSocketsDo $ withManager $ \manager -> do
                    liftIO $ Ex.throwTo watchTid (userError "process finished")
            loop list
            n <- liftIO $ cabal `isNewerThan` (bd </> "setup-config")
-           if n then mainOuterLoop iappPort filesModified else go
+           if n then mainOuterLoop develHsPath iappPort filesModified else go
 
 runBuildHook :: Maybe String -> IO ()
 runBuildHook (Just s) = do
@@ -303,6 +300,8 @@ configure opts extraArgs =
   checkExit =<< createProcess (proc (cabalProgram opts) $
                                  [ "configure"
                                  , "-flibrary-only"
+                                 , "--disable-tests"
+                                 , "--disable-benchmarks"
                                  , "-fdevel"
                                  , "--disable-library-profiling"
                                  , "--with-ld=yesod-ld-wrapper"
@@ -382,10 +381,18 @@ watchForChanges filesModified hsSourceDirs extraFiles list t = do
 
     isHaskell filename _ = takeExtension filename `elem` [".hs", ".lhs", ".hsc", ".cabal"]
 
-checkDevelFile :: IO ()
-checkDevelFile = do
-  e <- doesFileExist "devel.hs"
-  unless e $ failWith "file devel.hs not found"
+checkDevelFile :: IO FilePath
+checkDevelFile =
+    loop paths
+  where
+    paths = ["app/devel.hs", "devel.hs", "src/devel.hs"]
+
+    loop [] = failWith $ "file devel.hs not found, checked: " ++ show paths
+    loop (x:xs) = do
+        e <- doesFileExist x
+        if e
+            then return x
+            else loop xs
 
 checkCabalFile :: D.GenericPackageDescription -> IO ([FilePath], D.Library)
 checkCabalFile gpd = case D.condLibrary gpd of
@@ -401,7 +408,7 @@ checkCabalFile gpd = case D.condLibrary gpd of
            unless (null unlisted) $ do
                 putStrLn "WARNING: the following source files are not listed in exposed-modules or other-modules:"
                 mapM_ putStrLn unlisted
-           when (D.fromString "Application" `notElem` D.exposedModules dLib) $
+           when ("Application" `notElem` (map (last . D.components) $ D.exposedModules dLib)) $
                 putStrLn "WARNING: no exposed module Application"
            return (hsSourceDirs, dLib)
 
@@ -411,7 +418,7 @@ failWith msg = do
     exitFailure
 
 checkFileList :: FileList -> D.Library -> [FilePath]
-checkFileList fl lib = filter isUnlisted . filter isSrcFile $ sourceFiles
+checkFileList fl lib = filter (not . isSetup) . filter isUnlisted . filter isSrcFile $ sourceFiles
   where
     al = allModules lib
     -- a file is only a possible 'module file' if all path pieces start with a capital letter
@@ -420,6 +427,12 @@ checkFileList fl lib = filter isUnlisted . filter isSrcFile $ sourceFiles
                      in  all (isUpper . head) dirs && (takeExtension file `elem` [".hs", ".lhs"])
     isUnlisted file = not (toModuleName file `Set.member` al)
     toModuleName = L.intercalate "." . filter (/=".") . splitDirectories . dropExtension
+
+    isSetup "Setup.hs" = True
+    isSetup "./Setup.hs" = True
+    isSetup "Setup.lhs" = True
+    isSetup "./Setup.lhs" = True
+    isSetup _ = False
 
 allModules :: D.Library -> Set.Set String
 allModules lib = Set.fromList $ map toString $ D.exposedModules lib ++ (D.otherModules . D.libBuildInfo) lib

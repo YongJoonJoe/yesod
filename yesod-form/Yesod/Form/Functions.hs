@@ -1,4 +1,5 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -23,13 +24,17 @@ module Yesod.Form.Functions
     , runFormGet
       -- * Generate a blank form
     , generateFormPost
+    , generateFormGet'
     , generateFormGet
+      -- * More than one form on a handler
+    , identifyForm
       -- * Rendering
     , FormRender
     , renderTable
     , renderDivs
     , renderDivsNoLabels
     , renderBootstrap
+    , renderBootstrap2
       -- * Validation
     , check
     , checkBool
@@ -39,15 +44,17 @@ module Yesod.Form.Functions
       -- * Utilities
     , fieldSettingsLabel
     , parseHelper
+    , parseHelperGen
+    , convertField
     ) where
 
 import Yesod.Form.Types
 import Data.Text (Text, pack)
 import Control.Arrow (second)
-import Control.Monad.Trans.RWS (ask, get, put, runRWST, tell, evalRWST)
+import Control.Monad.Trans.RWS (ask, get, put, runRWST, tell, evalRWST, local)
 import Control.Monad.Trans.Class
 import Control.Monad (liftM, join)
-import Crypto.Classes (constTimeEq)
+import Data.Byteable (constEqBytes)
 import Text.Blaze (Markup, toMarkup)
 #define Html Markup
 #define toHtml toMarkup
@@ -182,7 +189,7 @@ runFormGeneric :: Monad m
                -> [Text]
                -> Maybe (Env, FileEnv)
                -> m (a, Enctype)
-runFormGeneric form site langs env = evalRWST form (env, site, langs) (IntSingle 1)
+runFormGeneric form site langs env = evalRWST form (env, site, langs) (IntSingle 0)
 
 -- | This function is used to both initially render a form and to later extract
 -- results from it. Note that, due to CSRF protection and a few other issues,
@@ -220,7 +227,7 @@ postHelper form env = do
                     | not (Map.lookup tokenKey params === reqToken req) ->
                         FormFailure [renderMessage m langs MsgCsrfWarning]
                 _ -> res
-            where (Just [t1]) === (Just t2) = TE.encodeUtf8 t1 `constTimeEq` TE.encodeUtf8 t2
+            where (Just [t1]) === (Just t2) = TE.encodeUtf8 t1 `constEqBytes` TE.encodeUtf8 t2
                   Nothing     === Nothing   = True   -- It's important to use constTimeEq
                   _           === _         = False  -- in order to avoid timing attacks.
     return ((res', xml), enctype)
@@ -266,6 +273,17 @@ runFormGet form = do
                 Just _ -> Just (Map.unionsWith (++) $ map (\(x, y) -> Map.singleton x [y]) gets, Map.empty)
     getHelper form env
 
+{- FIXME: generateFormGet' "Will be renamed to generateFormGet in next verison of Yesod" -}
+-- |
+--
+-- Since 1.3.11
+generateFormGet'
+    :: (RenderMessage (HandlerSite m) FormMessage, MonadHandler m)
+    => (Html -> MForm m (FormResult a, xml))
+    -> m (xml, Enctype)
+generateFormGet' form = first snd `liftM` getHelper form Nothing
+
+{-# DEPRECATED generateFormGet "Will require RenderMessage in next verison of Yesod" #-}
 generateFormGet :: MonadHandler m
                 => (Html -> MForm m a)
                 -> m (a, Enctype)
@@ -284,21 +302,78 @@ getHelper form env = do
     m <- getYesod
     runFormGeneric (form fragment) m langs env
 
+
+-- | Creates a hidden field on the form that identifies it.  This
+-- identification is then used to distinguish between /missing/
+-- and /wrong/ form data when a single handler contains more than
+-- one form.
+--
+-- For instance, if you have the following code on your handler:
+--
+-- > ((fooRes, fooWidget), fooEnctype) <- runFormPost fooForm
+-- > ((barRes, barWidget), barEnctype) <- runFormPost barForm
+--
+-- Then replace it with
+--
+-- > ((fooRes, fooWidget), fooEnctype) <- runFormPost $ identifyForm "foo" fooForm
+-- > ((barRes, barWidget), barEnctype) <- runFormPost $ identifyForm "bar" barForm
+--
+-- Note that it's your responsibility to ensure that the
+-- identification strings are unique (using the same one twice on a
+-- single handler will not generate any errors).  This allows you
+-- to create a variable number of forms and still have them work
+-- even if their number or order change between the HTML
+-- generation and the form submission.
+identifyForm
+  :: Monad m
+  => Text -- ^ Form identification string.
+  -> (Html -> MForm m (FormResult a, WidgetT (HandlerSite m) IO ()))
+  -> (Html -> MForm m (FormResult a, WidgetT (HandlerSite m) IO ()))
+identifyForm identVal form = \fragment -> do
+    -- Create hidden <input>.
+    let fragment' =
+          [shamlet|
+            <input type=hidden name=#{identifyFormKey} value=#{identVal}>
+            #{fragment}
+          |]
+
+    -- Check if we got its value back.
+    mp <- askParams
+    let missing = (mp >>= Map.lookup identifyFormKey) /= Just [identVal]
+
+    -- Run the form proper (with our hidden <input>).  If the
+    -- data is missing, then do not provide any params to the
+    -- form, which will turn its result into FormMissing.  Also,
+    -- doing this avoids having lots of fields with red errors.
+    let eraseParams | missing   = local (\(_, h, l) -> (Nothing, h, l))
+                    | otherwise = id
+    eraseParams (form fragment')
+
+identifyFormKey :: Text
+identifyFormKey = "_formid"
+
+
 type FormRender m a =
        AForm m a
     -> Html
     -> MForm m (FormResult a, WidgetT (HandlerSite m) IO ())
 
 renderTable, renderDivs, renderDivsNoLabels :: Monad m => FormRender m a
+-- | Render a form into a series of tr tags. Note that, in order to allow
+-- you to add extra rows to the table, this function does /not/ wrap up
+-- the resulting HTML in a table tag; you must do that yourself.
 renderTable aform fragment = do
     (res, views') <- aFormToForm aform
     let views = views' []
     let widget = [whamlet|
 $newline never
-\#{fragment}
-$forall view <- views
+$if null views
+    \#{fragment}
+$forall (isFirst, view) <- addIsFirst views
     <tr :fvRequired view:.required :not $ fvRequired view:.optional>
         <td>
+            $if isFirst
+                \#{fragment}
             <label for=#{fvId view}>#{fvLabel view}
             $maybe tt <- fvTooltip view
                 <div .tooltip>#{tt}
@@ -307,6 +382,9 @@ $forall view <- views
             <td .errors>#{err}
 |]
     return (res, widget)
+  where
+    addIsFirst [] = []
+    addIsFirst (x:y) = (True, x) : map (False, ) y
 
 -- | render a field inside a div
 renderDivs = renderDivsMaybeLabels True
@@ -333,7 +411,9 @@ $forall view <- views
 |]
     return (res, widget)
 
--- | Render a form using Bootstrap-friendly shamlet syntax.
+-- | Render a form using Bootstrap v2-friendly shamlet syntax.
+-- If you're using Bootstrap v3, then you should use the
+-- functions from module "Yesod.Form.Bootstrap3".
 --
 -- Sample Hamlet:
 --
@@ -348,8 +428,10 @@ $forall view <- views
 -- >      ^{formWidget}
 -- >      <div .form-actions>
 -- >        <input .btn .primary type=submit value=_{MsgSubmit}>
-renderBootstrap :: Monad m => FormRender m a
-renderBootstrap aform fragment = do
+--
+-- Since 1.3.14
+renderBootstrap2 :: Monad m => FormRender m a
+renderBootstrap2 aform fragment = do
     (res, views') <- aFormToForm aform
     let views = views' []
         has (Just _) = True
@@ -368,6 +450,11 @@ renderBootstrap aform fragment = do
                                 <span .help-block>#{err}
                 |]
     return (res, widget)
+
+-- | Deprecated synonym for 'renderBootstrap2'.
+renderBootstrap :: Monad m => FormRender m a
+renderBootstrap = renderBootstrap2
+{-# DEPRECATED renderBootstrap "Please use the Yesod.Form.Bootstrap3 module." #-}
 
 check :: (Monad m, RenderMessage (HandlerSite m) msg)
       => (a -> Either msg a)
@@ -428,6 +515,41 @@ fieldSettingsLabel msg = FieldSettings (SomeMessage msg) Nothing Nothing Nothing
 parseHelper :: (Monad m, RenderMessage site FormMessage)
             => (Text -> Either FormMessage a)
             -> [Text] -> [FileInfo] -> m (Either (SomeMessage site) (Maybe a))
-parseHelper _ [] _ = return $ Right Nothing
-parseHelper _ ("":_) _ = return $ Right Nothing
-parseHelper f (x:_) _ = return $ either (Left . SomeMessage) (Right . Just) $ f x
+parseHelper = parseHelperGen
+
+-- | A generalized version of 'parseHelper', allowing any type for the message
+-- indicating a bad parse.
+--
+-- Since 1.3.6
+parseHelperGen :: (Monad m, RenderMessage site msg)
+               => (Text -> Either msg a)
+               -> [Text] -> [FileInfo] -> m (Either (SomeMessage site) (Maybe a))
+parseHelperGen _ [] _ = return $ Right Nothing
+parseHelperGen _ ("":_) _ = return $ Right Nothing
+parseHelperGen f (x:_) _ = return $ either (Left . SomeMessage) (Right . Just) $ f x
+
+-- | Since a 'Field' cannot be a 'Functor', it is not obvious how to "reuse" a Field
+-- on a @newtype@ or otherwise equivalent type. This function allows you to convert
+-- a @Field m a@ to a @Field m b@ assuming you provide a bidireccional
+-- convertion among the two, through the first two functions.
+--
+-- A simple example:
+--
+-- > import Data.Monoid
+-- > sumField :: (Functor m, Monad m, RenderMessage (HandlerSite m) FormMessage) => Field m (Sum Int)
+-- > sumField = convertField Sum getSum intField
+--
+-- Another example, not using a newtype, but instead creating a Lazy Text field:
+--
+-- > import qualified Data.Text.Lazy as TL
+-- > TextField :: (Functor m, Monad m, RenderMessage (HandlerSite m) FormMessage) => Field m TL.Text
+-- > lazyTextField = convertField TL.fromStrict TL.toStrict textField
+--
+-- Since 1.3.16
+convertField :: (Functor m)
+             => (a -> b) -> (b -> a)
+             -> Field m a -> Field m b
+convertField to from (Field fParse fView fEnctype) = let
+  fParse' ts = fmap (fmap (fmap to)) . fParse ts
+  fView' ti tn at ei = fView ti tn at (fmap from ei)
+  in Field fParse' fView' fEnctype

@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeSynonymInstances, OverloadedStrings #-}
+{-# LANGUAGE CPP #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 module Yesod.Core.Json
     ( -- * Convert from a JSON value
@@ -10,6 +11,7 @@ module Yesod.Core.Json
       -- * Convert to a JSON value
     , parseJsonBody
     , parseJsonBody_
+    , requireJsonBody
 
       -- * Produce JSON values
     , J.Value (..)
@@ -41,6 +43,7 @@ import Data.Conduit.Attoparsec (sinkParser)
 import Data.Text (pack)
 import qualified Data.Vector as V
 import Data.Conduit
+import Data.Conduit.Lift
 import qualified Data.ByteString.Char8 as B8
 import Data.Maybe (listToMaybe)
 import Control.Monad (liftM)
@@ -91,7 +94,7 @@ provideJson = provideRep . return . J.toJSON
 -- /Since: 0.3.0/
 parseJsonBody :: (MonadHandler m, J.FromJSON a) => m (J.Result a)
 parseJsonBody = do
-    eValue <- runExceptionT $ rawRequestBody $$ sinkParser JP.value'
+    eValue <- rawRequestBody $$ runCatchC (sinkParser JP.value')
     return $ case eValue of
         Left e -> J.Error $ show e
         Right value -> J.fromJSON value
@@ -99,7 +102,13 @@ parseJsonBody = do
 -- | Same as 'parseJsonBody', but return an invalid args response on a parse
 -- error.
 parseJsonBody_ :: (MonadHandler m, J.FromJSON a) => m a
-parseJsonBody_ = do
+parseJsonBody_ = requireJsonBody
+{-# DEPRECATED parseJsonBody_ "Use requireJsonBody instead" #-}
+
+-- | Same as 'parseJsonBody', but return an invalid args response on a parse
+-- error.
+requireJsonBody :: (MonadHandler m, J.FromJSON a) => m a
+requireJsonBody = do
     ra <- parseJsonBody
     case ra of
         J.Error s -> invalidArgs [pack s]

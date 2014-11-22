@@ -1,5 +1,5 @@
 name:            yesod-static
-version:         1.2.2.1
+version:         1.4.0.3
 license:         MIT
 license-file:    LICENSE
 author:          Michael Snoyman <michael@snoyman.com>
@@ -22,14 +22,15 @@ extra-source-files:
   test/embed-dir/foo
   test/embed-dir/lorem.txt
   test/embed-dir/abc/def.txt
+  ChangeLog.md
 
 library
     build-depends:   base                  >= 4        && < 5
                    , containers            >= 0.2
                    , old-time              >= 1.0
-                   , yesod-core            >= 1.2      && < 1.3
+                   , yesod-core            >= 1.4      && < 1.5
                    , base64-bytestring     >= 0.1.0.1
-                   , cereal                >= 0.3
+                   , byteable              >= 0.1
                    , bytestring            >= 0.9.1.4
                    , template-haskell
                    , directory             >= 1.0
@@ -41,25 +42,33 @@ library
                    , http-types            >= 0.7
                    , unix-compat           >= 0.2
                    , conduit               >= 0.5
-                   , crypto-conduit        >= 0.4
-                   , cryptohash-cryptoapi  >= 0.1.0
+                   , conduit-extra
+                   , cryptohash-conduit    >= 0.1
+                   , cryptohash            >= 0.11
                    , system-filepath       >= 0.4.6    && < 0.5
                    , system-fileio         >= 0.3
                    , data-default
-                   , shakespeare-css       >= 1.0.3
                    , mime-types            >= 0.1
                    , hjsmin
-                   , process-conduit       >= 1.0      && < 1.1
                    , filepath              >= 1.3
                    , resourcet             >= 0.4
                    , unordered-containers  >= 0.2
+                   , process
+                   , async
+
+                   , attoparsec            >= 0.10
+                   , blaze-builder         >= 0.3
+                   , css-text              >= 0.1.2
+                   , hashable              >= 1.1
 
     exposed-modules: Yesod.Static
                      Yesod.EmbeddedStatic
                      Yesod.EmbeddedStatic.Generators
                      Yesod.EmbeddedStatic.Types
+                     Yesod.EmbeddedStatic.Css.AbsoluteUrl
 
     other-modules:   Yesod.EmbeddedStatic.Internal
+                     Yesod.EmbeddedStatic.Css.Util
 
     ghc-options:     -Wall
     extensions: TemplateHaskell
@@ -71,8 +80,8 @@ test-suite tests
     cpp-options:   -DTEST_EXPORT
     build-depends:   base
                    , hspec >= 1.3
-                   , yesod-test >= 1.2
-                   , wai-test
+                   , yesod-test >= 1.4
+                   , wai-extra
                    , HUnit
 
                    -- copy from above
@@ -80,8 +89,8 @@ test-suite tests
                    , old-time
                    , yesod-core
                    , base64-bytestring
-                   , cereal
                    , bytestring
+                   , byteable
                    , template-haskell
                    , directory
                    , transformers
@@ -92,20 +101,21 @@ test-suite tests
                    , http-types
                    , unix-compat
                    , conduit
-                   , crypto-conduit
-                   , cryptohash-cryptoapi
+                   , cryptohash-conduit
+                   , cryptohash
                    , system-filepath
                    , system-fileio
                    , data-default
-                   , shakespeare-css
                    , mime-types
                    , hjsmin
-                   , process-conduit
                    , filepath
                    , resourcet
                    , unordered-containers
+                   , async
+                   , process
+                   , conduit-extra
 
-    ghc-options:     -Wall
+    ghc-options:     -Wall -threaded
     extensions: TemplateHaskell
 
 source-repository head

@@ -1,5 +1,6 @@
 {-# LANGUAGE TypeFamilies, QuasiQuotes, TemplateHaskell, MultiParamTypeClasses, OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ViewPatterns #-}
 module YesodCoreTest.ErrorHandling
     ( errorHandlingTest
     , Widget
@@ -13,6 +14,11 @@ import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Char8 as S8
 import Control.Exception (SomeException, try)
 import Network.HTTP.Types (mkStatus)
+import Blaze.ByteString.Builder (Builder, fromByteString, toLazyByteString)
+import Data.Monoid (mconcat)
+import Data.Text (Text, pack)
+import Control.Monad (forM_)
+import qualified Control.Exception.Lifted as E
 
 data App = App
 
@@ -24,11 +30,14 @@ mkYesod "App" [parseRoutes|
 /error-in-body ErrorInBodyR GET
 /error-in-body-noeval ErrorInBodyNoEvalR GET
 /override-status OverrideStatusR GET
+/error/#Int ErrorR GET
 
 -- https://github.com/yesodweb/yesod/issues/658
 /builder BuilderR GET
 /file-bad-len FileBadLenR GET
 /file-bad-name FileBadNameR GET
+
+/good-builder GoodBuilderR GET
 |]
 
 overrideStatus = mkStatus 15 "OVERRIDE"
@@ -88,6 +97,24 @@ getFileBadLenR = return $ TypedContent "ignored" $ ContentFile "yesod-core.cabal
 getFileBadNameR :: Handler TypedContent
 getFileBadNameR = return $ TypedContent "ignored" $ ContentFile (error "filebadname") Nothing
 
+goodBuilderContent :: Builder
+goodBuilderContent = mconcat $ replicate 100 $ fromByteString "This is a test\n"
+
+getGoodBuilderR :: Handler TypedContent
+getGoodBuilderR = return $ TypedContent "text/plain" $ toContent goodBuilderContent
+
+getErrorR :: Int -> Handler ()
+getErrorR 1 = setSession undefined "foo"
+getErrorR 2 = setSession "foo" undefined
+getErrorR 3 = deleteSession undefined
+getErrorR 4 = addHeader undefined "foo"
+getErrorR 5 = addHeader "foo" undefined
+getErrorR 6 = expiresAt undefined
+getErrorR 7 = setLanguage undefined
+getErrorR 8 = cacheSeconds undefined
+getErrorR 9 = setUltDest (undefined :: Text)
+getErrorR 10 = setMessage undefined
+
 errorHandlingTest :: Spec
 errorHandlingTest = describe "Test.ErrorHandling" $ do
       it "says not found" caseNotFound
@@ -99,8 +126,10 @@ errorHandlingTest = describe "Test.ErrorHandling" $ do
       it "builder" caseBuilder
       it "file with bad len" caseFileBadLen
       it "file with bad name" caseFileBadName
+      it "builder includes content-length" caseGoodBuilder
+      forM_ [1..10] $ \i -> it ("error case " ++ show i) (caseError i)
 
-runner :: Session () -> IO ()
+runner :: Session a -> IO a
 runner f = toWaiApp App >>= runSession f
 
 caseNotFound :: IO ()
@@ -147,11 +176,10 @@ caseErrorInBody = runner $ do
 caseErrorInBodyNoEval :: IO ()
 caseErrorInBodyNoEval = do
     eres <- try $ runner $ do
-        _ <- request defaultRequest { pathInfo = ["error-in-body-noeval"] }
-        return ()
+        request defaultRequest { pathInfo = ["error-in-body-noeval"] }
     case eres of
         Left (_ :: SomeException) -> return ()
-        Right _ -> error "Expected an exception"
+        Right x -> error $ "Expected an exception, got: " ++ show x
 
 caseOverrideStatus :: IO ()
 caseOverrideStatus = runner $ do
@@ -175,3 +203,18 @@ caseFileBadName = runner $ do
     res <- request defaultRequest { pathInfo = ["file-bad-name"] }
     assertStatus 500 res
     assertBodyContains "filebadname" res
+
+caseGoodBuilder :: IO ()
+caseGoodBuilder = runner $ do
+    res <- request defaultRequest { pathInfo = ["good-builder"] }
+    assertStatus 200 res
+    let lbs = toLazyByteString goodBuilderContent
+    assertBody lbs res
+    assertHeader "content-length" (S8.pack $ show $ L.length lbs) res
+
+caseError :: Int -> IO ()
+caseError i = runner $ do
+    res <- request defaultRequest { pathInfo = ["error", pack $ show i] }
+    assertStatus 500 res `E.catch` \e -> do
+        liftIO $ print res
+        E.throwIO (e :: E.SomeException)

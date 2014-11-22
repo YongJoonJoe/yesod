@@ -60,14 +60,22 @@ import Data.Monoid (mempty)
 
 import Text.Hamlet (Html)
 import Text.Blaze.Html.Renderer.Utf8 (renderHtmlBuilder)
-import Data.Conduit (Source, ResourceT, Flush (Chunk), ResumableSource, mapOutput)
+import Data.Conduit (Source, Flush (Chunk), ResumableSource, mapOutput)
+import Control.Monad.Trans.Resource (ResourceT)
 import Data.Conduit.Internal (ResumableSource (ResumableSource))
+import qualified Data.Conduit.Internal as CI
 
 import qualified Data.Aeson as J
+#if MIN_VERSION_aeson(0, 7, 0)
+import Data.Aeson.Encode (encodeToTextBuilder)
+#else
 import Data.Aeson.Encode (fromValue)
+#endif
 import qualified Blaze.ByteString.Builder.Char.Utf8 as Blaze
 import Data.Text.Lazy.Builder (toLazyText)
 import Yesod.Core.Types
+import Text.Lucius (Css, renderCss)
+import Text.Julius (Javascript, unJavascript)
 
 -- | Zero-length enumerator.
 emptyContent :: Content
@@ -106,6 +114,14 @@ instance ToContent (ContentType, Content) where
     toContent = snd
 instance ToContent TypedContent where
     toContent (TypedContent _ c) = c
+
+instance ToContent Css where
+    toContent = toContent . renderCss
+instance ToContent Javascript where
+    toContent = toContent . toLazyText . unJavascript
+
+instance ToFlushBuilder builder => ToContent (CI.Pipe () () builder () (ResourceT IO) ()) where
+    toContent src = ContentSource $ CI.ConduitM (CI.mapOutput toFlushBuilder src >>=)
 
 instance ToFlushBuilder builder => ToContent (Source (ResourceT IO) builder) where
     toContent src = ContentSource $ mapOutput toFlushBuilder src
@@ -231,7 +247,11 @@ instance ToContent J.Value where
     toContent = flip ContentBuilder Nothing
               . Blaze.fromLazyText
               . toLazyText
+#if MIN_VERSION_aeson(0, 7, 0)
+              . encodeToTextBuilder
+#else
               . fromValue
+#endif
 instance HasContentType J.Value where
     getContentType _ = typeJson
 
@@ -243,6 +263,12 @@ instance HasContentType Text where
 
 instance HasContentType T.Text where
     getContentType _ = typePlain
+
+instance HasContentType Css where
+    getContentType _ = typeCss
+
+instance HasContentType Javascript where
+    getContentType _ = typeJavascript
 
 -- | Any type which can be converted to 'TypedContent'.
 --
@@ -276,3 +302,8 @@ instance ToTypedContent a => ToTypedContent (DontFullyEvaluate a) where
     toTypedContent (DontFullyEvaluate a) =
         let TypedContent ct c = toTypedContent a
          in TypedContent ct (ContentDontEvaluate c)
+
+instance ToTypedContent Css where
+    toTypedContent = TypedContent typeCss . toContent
+instance ToTypedContent Javascript where
+    toTypedContent = TypedContent typeJavascript . toContent

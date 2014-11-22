@@ -1,13 +1,13 @@
-./yesod-routes
 ./yesod-core
 ./yesod-static
 ./yesod-persistent
 ./yesod-newsfeed
 ./yesod-form
 ./yesod-auth
+./yesod-auth-oauth
 ./yesod-sitemap
 ./yesod-test
 ./yesod-bin
 ./yesod
-./authenticate
 ./yesod-eventsource
+./yesod-websockets

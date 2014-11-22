@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, TemplateHaskell, QuasiQuotes, TypeFamilies, MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings, TemplateHaskell, QuasiQuotes, TypeFamilies, MultiParamTypeClasses, ViewPatterns #-}
 module YesodCoreTest.Json (specs, Widget) where
 
 import Yesod.Core
@@ -19,7 +19,7 @@ instance Yesod App
 
 getHomeR :: Handler RepPlain
 getHomeR = do
-    val <- parseJsonBody_
+    val <- requireJsonBody
     case Map.lookup ("foo" :: Text) val of
         Nothing -> invalidArgs ["foo not found"]
         Just foo -> return $ RepPlain $ toContent (foo :: Text)

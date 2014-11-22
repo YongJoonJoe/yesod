@@ -27,6 +27,7 @@ module Yesod.Core.Dispatch
     , warpDebug
     , warpEnv
     , mkDefaultMiddlewares
+    , defaultMiddlewaresNoLogging
       -- * WAI subsites
     , WaiSubsite (..)
     ) where
@@ -41,7 +42,7 @@ import qualified Network.Wai as W
 
 import Data.ByteString.Lazy.Char8 ()
 
-import Data.Text (Text, pack)
+import Data.Text (Text)
 import Data.Monoid (mappend)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Char8 as S8
@@ -64,8 +65,10 @@ import Network.Wai.Middleware.MethodOverride
 import qualified Network.Wai.Handler.Warp
 import System.Log.FastLogger
 import Control.Monad.Logger
+import Control.Monad (when)
 import qualified Paths_yesod_core
 import Data.Version (showVersion)
+import qualified System.Random.MWC as MWC
 
 -- | Convert the given argument into a WAI application, executable with any WAI
 -- handler. This function will provide no middlewares; if you want commonly
@@ -74,10 +77,12 @@ toWaiAppPlain :: YesodDispatch site => site -> IO W.Application
 toWaiAppPlain site = do
     logger <- makeLogger site
     sb <- makeSessionBackend site
+    gen <- MWC.createSystemRandom
     return $ toWaiAppYre $ YesodRunnerEnv
             { yreLogger = logger
             , yreSite = site
             , yreSessionBackend = sb
+            , yreGen = gen
             }
 
 toWaiAppYre :: YesodDispatch site => YesodRunnerEnv site -> W.Application
@@ -90,8 +95,8 @@ toWaiAppYre yre req =
   where
     site = yreSite yre
     sendRedirect :: Yesod master => master -> [Text] -> W.Application
-    sendRedirect y segments' env =
-         return $ W.responseLBS status301
+    sendRedirect y segments' env sendResponse =
+         sendResponse $ W.responseLBS status301
                 [ ("Content-Type", "text/plain")
                 , ("Location", Blaze.ByteString.Builder.toByteString dest')
                 ] "Redirecting"
@@ -123,10 +128,12 @@ toWaiApp site = do
 toWaiAppLogger :: YesodDispatch site => Logger -> site -> IO W.Application
 toWaiAppLogger logger site = do
     sb <- makeSessionBackend site
+    gen <- MWC.createSystemRandom
     let yre = YesodRunnerEnv
                 { yreLogger = logger
                 , yreSite = site
                 , yreSessionBackend = sb
+                , yreGen = gen
                 }
     messageLoggerSource
         site
@@ -150,27 +157,30 @@ toWaiAppLogger logger site = do
 warp :: YesodDispatch site => Int -> site -> IO ()
 warp port site = do
     logger <- makeLogger site
-    toWaiAppLogger logger site >>= Network.Wai.Handler.Warp.runSettings
-        Network.Wai.Handler.Warp.defaultSettings
-            { Network.Wai.Handler.Warp.settingsPort = port
-            {- FIXME
-            , Network.Wai.Handler.Warp.settingsServerName = S8.pack $ concat
-                [ "Warp/"
-                , Network.Wai.Handler.Warp.warpVersion
-                , " + Yesod/"
-                , showVersion Paths_yesod_core.version
-                , " (core)"
-                ]
-            -}
-            , Network.Wai.Handler.Warp.settingsOnException = const $ \e ->
+    toWaiAppLogger logger site >>= Network.Wai.Handler.Warp.runSettings (
+        Network.Wai.Handler.Warp.setPort port $
+        Network.Wai.Handler.Warp.setServerName serverValue $
+        Network.Wai.Handler.Warp.setOnException (\_ e ->
+                when (shouldLog' e) $
                 messageLoggerSource
                     site
                     logger
                     $(qLocation >>= liftLoc)
                     "yesod-core"
                     LevelError
-                    (toLogStr $ "Exception from Warp: " ++ show e)
-            }
+                    (toLogStr $ "Exception from Warp: " ++ show e)) $
+        Network.Wai.Handler.Warp.defaultSettings)
+  where
+    shouldLog' = Network.Wai.Handler.Warp.defaultShouldDisplayException
+
+serverValue :: S8.ByteString
+serverValue = S8.pack $ concat
+    [ "Warp/"
+    , Network.Wai.Handler.Warp.warpVersion
+    , " + Yesod/"
+    , showVersion Paths_yesod_core.version
+    , " (core)"
+    ]
 
 -- | A default set of middlewares.
 --
@@ -178,18 +188,16 @@ warp port site = do
 mkDefaultMiddlewares :: Logger -> IO W.Middleware
 mkDefaultMiddlewares logger = do
     logWare <- mkRequestLogger def
-#if MIN_VERSION_fast_logger(2, 0, 0)
         { destination = Network.Wai.Middleware.RequestLogger.Logger $ loggerSet logger
-#else
-        { destination = Logger logger
-#endif
         , outputFormat = Apache FromSocket
         }
-    return $ logWare
-           . acceptOverride
-           . autohead
-           . gzip def
-           . methodOverride
+    return $ logWare . defaultMiddlewaresNoLogging
+
+-- | All of the default middlewares, excluding logging.
+--
+-- Since 1.2.12
+defaultMiddlewaresNoLogging :: W.Middleware
+defaultMiddlewaresNoLogging = acceptOverride . autohead . gzip def . methodOverride
 
 -- | Deprecated synonym for 'warp'.
 warpDebug :: YesodDispatch site => Int -> site -> IO ()

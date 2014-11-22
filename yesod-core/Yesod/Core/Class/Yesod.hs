@@ -14,10 +14,12 @@ import           Yesod.Routes.Class
 import           Blaze.ByteString.Builder           (Builder)
 import           Blaze.ByteString.Builder.Char.Utf8 (fromText)
 import           Control.Arrow                      ((***), second)
+import           Control.Exception                  (bracket)
 import           Control.Monad                      (forM, when, void)
 import           Control.Monad.IO.Class             (MonadIO (liftIO))
 import           Control.Monad.Logger               (LogLevel (LevelInfo, LevelOther),
                                                      LogSource)
+import           Control.Monad.Trans.Resource       (InternalState, createInternalState, closeInternalState)
 import qualified Data.ByteString.Char8              as S8
 import qualified Data.ByteString.Lazy               as L
 import Data.Aeson (object, (.=))
@@ -39,17 +41,8 @@ import qualified Network.Wai                        as W
 import           Data.Default                       (def)
 import           Network.Wai.Parse                  (lbsBackEnd,
                                                      tempFileBackEnd)
-import           System.IO                          (stdout)
-#if MIN_VERSION_fast_logger(2, 0, 0)
 import           Network.Wai.Logger                 (ZonedDate, clockDateCacher)
 import           System.Log.FastLogger
-import qualified GHC.IO.FD
-#else
-import           System.Log.FastLogger.Date         (ZonedDate)
-import           System.Log.FastLogger              (LogStr (..), Logger,
-                                                     loggerDate, loggerPutStr,
-                                                     mkLogger)
-#endif
 import           Text.Blaze                         (customAttribute, textTag,
                                                      toValue, (!))
 import           Text.Blaze                         (preEscapedToMarkup)
@@ -94,7 +87,7 @@ class RenderRoute site => Yesod site where
     defaultLayout w = do
         p <- widgetToPageContent w
         mmsg <- getMessage
-        giveUrlRenderer [hamlet|
+        withUrlRenderer [hamlet|
             $newline never
             $doctype 5
             <html>
@@ -216,18 +209,10 @@ class RenderRoute site => Yesod site where
     --
     -- Default: Sends to stdout and automatically flushes on each write.
     makeLogger :: site -> IO Logger
-#if MIN_VERSION_fast_logger(2, 0, 0)
     makeLogger _ = do
-#if MIN_VERSION_fast_logger(2, 1, 0)
-        loggerSet <- newLoggerSet defaultBufSize Nothing
-#else
-        loggerSet <- newLoggerSet defaultBufSize GHC.IO.FD.stdout
-#endif
+        loggerSet' <- newStdoutLoggerSet defaultBufSize
         (getter, _) <- clockDateCacher
-        return $! Logger loggerSet getter
-#else
-    makeLogger _ = mkLogger True stdout
-#endif
+        return $! Logger loggerSet' getter
 
     -- | Send a message to the @Logger@ provided by @getLogger@.
     --
@@ -300,6 +285,20 @@ class RenderRoute site => Yesod site where
     -- Since: 1.1.6
     yesodMiddleware :: ToTypedContent res => HandlerT site IO res -> HandlerT site IO res
     yesodMiddleware = defaultYesodMiddleware
+
+    -- | How to allocate an @InternalState@ for each request.
+    --
+    -- The default implementation is almost always what you want. However, if
+    -- you know that you are never taking advantage of the @MonadResource@
+    -- instance in your handler functions, setting this to a dummy
+    -- implementation can provide a small optimization. Only do this if you
+    -- really know what you're doing, otherwise you can turn safe code into a
+    -- runtime error!
+    --
+    -- Since 1.4.2
+    yesodWithInternalState :: site -> Maybe (Route site) -> (InternalState -> IO a) -> IO a
+    yesodWithInternalState _ _ = bracket createInternalState closeInternalState
+    {-# INLINE yesodWithInternalState #-}
 
 -- | Default implementation of 'yesodMiddleware'. Adds the response header
 -- \"Vary: Accept, Accept-Language\" and performs authorization checks.
@@ -541,7 +540,6 @@ asyncHelper render scripts jscript jsLoc =
                     Nothing -> Nothing
                     Just j -> Just $ jelper j
 
-#if MIN_VERSION_fast_logger(2, 0, 0)
 formatLogMessage :: IO ZonedDate
                  -> Loc
                  -> LogSource
@@ -564,33 +562,6 @@ formatLogMessage getdate loc src level msg = do
         " @(" `mappend`
         toLogStr (fileLocationToString loc) `mappend`
         ")\n"
-#else
-formatLogMessage :: IO ZonedDate
-                 -> Loc
-                 -> LogSource
-                 -> LogLevel
-                 -> LogStr -- ^ message
-                 -> IO [LogStr]
-formatLogMessage getdate loc src level msg = do
-    now <- getdate
-    return
-        [ LB now
-        , LB " ["
-        , LS $
-            case level of
-                LevelOther t -> T.unpack t
-                _ -> drop 5 $ show level
-        , LS $
-            if T.null src
-                then ""
-                else "#" ++ T.unpack src
-        , LB "] "
-        , msg
-        , LB " @("
-        , LS $ fileLocationToString loc
-        , LB ")\n"
-        ]
-#endif
 
 -- | Customize the cookies used by the session backend.  You may
 -- use this function on your definition of 'makeSessionBackend'.

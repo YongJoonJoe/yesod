@@ -18,6 +18,7 @@ module Yesod.Form.Fields
     , timeField
     , htmlField
     , emailField
+    , multiEmailField
     , searchField
     , AutoFocus
     , urlField
@@ -68,21 +69,25 @@ import Database.Persist.Sql (PersistField, PersistFieldSql (..))
 import Database.Persist (Entity (..), SqlType (SqlString))
 import Text.HTML.SanitizeXSS (sanitizeBalance)
 import Control.Monad (when, unless)
+import Data.Either (partitionEithers)
 import Data.Maybe (listToMaybe, fromMaybe)
 
 import qualified Blaze.ByteString.Builder.Html.Utf8 as B
 import Blaze.ByteString.Builder (writeByteString, toLazyByteString)
 import Blaze.ByteString.Builder.Internal.Write (fromWriteList)
-import Database.Persist (PersistMonadBackend, PersistEntityBackend)
+import Database.Persist (PersistEntityBackend)
 
 import Text.Blaze.Html.Renderer.String (renderHtml)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
-import Data.Text (Text, unpack, pack)
+import Data.Text as T ( Text, append, concat, cons, head
+                      , intercalate, isPrefixOf, null, unpack, pack, splitOn
+                      )
+import qualified Data.Text as T (drop, dropWhile)  
 import qualified Data.Text.Read
 
 import qualified Data.Map as Map
-import Yesod.Persist (selectList, runDB, Filter, SelectOpt, Key, YesodPersist, PersistEntity, PersistQuery, YesodDB)
+import Yesod.Persist (selectList, runDB, Filter, SelectOpt, Key, YesodPersist, PersistEntity, PersistQuery)
 import Control.Arrow ((&&&))
 
 import Control.Applicative ((<$>), (<|>))
@@ -115,7 +120,7 @@ $newline never
 doubleField :: Monad m => RenderMessage (HandlerSite m) FormMessage => Field m Double
 doubleField = Field
     { fieldParse = parseHelper $ \s ->
-        case Data.Text.Read.double s of
+        case Data.Text.Read.double (prependZero s) of
             Right (a, "") -> Right a
             _ -> Left $ MsgInvalidNumber s
 
@@ -157,9 +162,9 @@ $newline never
 htmlField :: Monad m => RenderMessage (HandlerSite m) FormMessage => Field m Html
 htmlField = Field
     { fieldParse = parseHelper $ Right . preEscapedText . sanitizeBalance
-    , fieldView = \theId name attrs val _isReq -> toWidget [hamlet|
+    , fieldView = \theId name attrs val isReq -> toWidget [hamlet|
 $newline never
-<textarea id="#{theId}" name="#{name}" *{attrs}>#{showVal val}
+<textarea :isReq:required="" id="#{theId}" name="#{name}" *{attrs}>#{showVal val}
 |]
     , fieldEnctype = UrlEncoded
     }
@@ -168,7 +173,7 @@ $newline never
 -- | A newtype wrapper around a 'Text' that converts newlines to HTML
 -- br-tags.
 newtype Textarea = Textarea { unTextarea :: Text }
-    deriving (Show, Read, Eq, PersistField, Ord)
+    deriving (Show, Read, Eq, PersistField, Ord, ToJSON, FromJSON)
 instance PersistFieldSql Textarea where
     sqlType _ = SqlString
 instance ToHtml Textarea where
@@ -188,9 +193,9 @@ instance ToHtml Textarea where
 textareaField :: Monad m => RenderMessage (HandlerSite m) FormMessage => Field m Textarea
 textareaField = Field
     { fieldParse = parseHelper $ Right . Textarea
-    , fieldView = \theId name attrs val _isReq -> toWidget [hamlet|
+    , fieldView = \theId name attrs val isReq -> toWidget [hamlet|
 $newline never
-<textarea id="#{theId}" name="#{name}" *{attrs}>#{either id unTextarea val}
+<textarea id="#{theId}" name="#{name}" :isReq:required="" *{attrs}>#{either id unTextarea val}
 |]
     , fieldEnctype = UrlEncoded
     }
@@ -228,7 +233,7 @@ $newline never
     }
 
 readMay :: Read a => String -> Maybe a
-readMay s = case reads s of
+readMay s = case filter (Prelude.null . snd) $ reads s of
                 (x, _):_ -> Just x
                 [] -> Nothing
 
@@ -302,12 +307,37 @@ $newline never
     , fieldEnctype = UrlEncoded
     }
 
+-- |
+--
+-- Since 1.3.7
+multiEmailField :: Monad m => RenderMessage (HandlerSite m) FormMessage => Field m [Text]
+multiEmailField = Field
+    { fieldParse = parseHelper $
+        \s ->
+            let addrs = map validate $ splitOn "," s
+            in case partitionEithers addrs of
+                ([], good) -> Right good
+                (bad, _) -> Left $ MsgInvalidEmail $ cat bad
+    , fieldView = \theId name attrs val isReq -> toWidget [hamlet|
+$newline never
+<input id="#{theId}" name="#{name}" *{attrs} type="email" multiple :isReq:required="" value="#{either id cat val}">
+|]
+    , fieldEnctype = UrlEncoded
+    }
+    where
+        -- report offending address along with error
+        validate a = case Email.validate $ encodeUtf8 a of
+                        Left e -> Left $ T.concat [a, " (",  pack e, ")"]
+                        Right r -> Right $ emailToText r
+        cat = intercalate ", "
+        emailToText = decodeUtf8With lenientDecode . Email.toByteString
+
 type AutoFocus = Bool
 searchField :: Monad m => RenderMessage (HandlerSite m) FormMessage => AutoFocus -> Field m Text
 searchField autoFocus = Field
     { fieldParse = parseHelper Right
     , fieldView = \theId name attrs val isReq -> do
-        [whamlet|\
+        [whamlet|
 $newline never
 <input id="#{theId}" name="#{name}" *{attrs} type="search" :isReq:required="" :autoFocus:autofocus="" value="#{either id id val}">
 |]
@@ -526,10 +556,10 @@ optionsEnum :: (MonadHandler m, Show a, Enum a, Bounded a) => m (OptionList a)
 optionsEnum = optionsPairs $ map (\x -> (pack $ show x, x)) [minBound..maxBound]
 
 optionsPersist :: ( YesodPersist site, PersistEntity a
-                  , PersistQuery (YesodDB site)
+                  , PersistQuery (PersistEntityBackend a)
                   , PathPiece (Key a)
-                  , PersistEntityBackend a ~ PersistMonadBackend (YesodDB site)
                   , RenderMessage site msg
+                  , YesodPersistBackend site ~ PersistEntityBackend a
                   )
                => [Filter a]
                -> [SelectOpt a]
@@ -551,10 +581,11 @@ optionsPersist filts ords toDisplay = fmap mkOptionList $ do
 optionsPersistKey
   :: (YesodPersist site
      , PersistEntity a
-     , PersistQuery (YesodPersistBackend site (HandlerT site IO))
+     , PersistQuery (PersistEntityBackend a)
      , PathPiece (Key a)
      , RenderMessage site msg
-     , PersistEntityBackend a ~ PersistMonadBackend (YesodDB site))
+     , YesodPersistBackend site ~ PersistEntityBackend a
+     )
   => [Filter a]
   -> [SelectOpt a]
   -> (a -> msg)
@@ -684,3 +715,19 @@ $newline never
 incrInts :: Ints -> Ints
 incrInts (IntSingle i) = IntSingle $ i + 1
 incrInts (IntCons i is) = (i + 1) `IntCons` is
+
+
+-- | Adds a '0' to some text so that it may be recognized as a double.
+--   The read ftn does not recognize ".3" as 0.3 nor "-.3" as -0.3, so this
+--   function changes ".xxx" to "0.xxx" and "-.xxx" to "-0.xxx"
+
+prependZero :: Text -> Text
+prependZero t0 = if T.null t1
+                 then t1
+                 else if T.head t1 == '.'
+                      then '0' `T.cons` t1
+                      else if "-." `T.isPrefixOf` t1
+                           then "-0." `T.append` (T.drop 2 t1)
+                           else t1
+
+  where t1 = T.dropWhile ((==) ' ') t0

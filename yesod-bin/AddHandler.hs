@@ -1,12 +1,13 @@
+{-# LANGUAGE PatternGuards #-}
 module AddHandler (addHandler) where
 
 import Prelude hiding (readFile)
 import System.IO (hFlush, stdout)
 import Data.Char (isLower, toLower, isSpace)
-import Data.List (isPrefixOf, isSuffixOf)
+import Data.List (isPrefixOf, isSuffixOf, stripPrefix)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import System.Directory (getDirectoryContents)
+import System.Directory (getDirectoryContents, doesFileExist)
 
 -- strict readFile
 readFile :: FilePath -> IO String
@@ -21,14 +22,28 @@ addHandler = do
             [] -> error "No cabal file found"
             _ -> error "Too many cabal files found"
 
-    putStr "Name of route (without trailing R): "
-    hFlush stdout
-    name <- getLine
-    case name of
-        [] -> error "Please provide a name"
-        c:_
-            | isLower c -> error "Name must start with an upper case letter"
-            | otherwise -> return ()
+    let routeInput = do
+        putStr "Name of route (without trailing R): "
+        hFlush stdout
+        name <- getLine
+        case name of
+            [] -> error "No name entered. Quitting ..."
+            c:_
+                | isLower c -> do
+                    putStrLn "Name must start with an upper case letter"
+                    routeInput
+                | otherwise -> do
+                    -- Check that the handler file doesn't already exist
+                    let handlerFile = concat ["Handler/", name, ".hs"]
+                    exists <- doesFileExist handlerFile
+                    if exists
+                        then do
+                            putStrLn $ "File already exists: " ++ show handlerFile
+                            putStrLn "Try another name or leave blank to exit"
+                            routeInput
+                        else return (name, handlerFile)
+
+    (name, handlerFile) <- routeInput
     putStr "Enter route pattern (ex: /entry/#EntryId): "
     hFlush stdout
     pattern <- getLine
@@ -41,24 +56,24 @@ addHandler = do
     modify "Application.hs" $ fixApp name
     modify cabal $ fixCabal name
     modify "config/routes" $ fixRoutes name pattern methods
-    writeFile ("Handler/" ++ name ++ ".hs") $ mkHandler name pattern methods
+    writeFile handlerFile $ mkHandler name pattern methods
 
 fixApp :: String -> String -> String
 fixApp name =
     unlines . reverse . go . reverse . lines
   where
-    l = "import Handler." ++ name
+    l spaces = "import " ++ spaces ++ "Handler." ++ name
 
-    go [] = [l]
+    go [] = [l ""]
     go (x:xs)
-        | "import Handler." `isPrefixOf` x = l : x : xs
+        | Just y <- stripPrefix "import " x, "Handler." `isPrefixOf` dropWhile (== ' ') y = l (takeWhile (== ' ') y) : x : xs
         | otherwise = x : go xs
 
 fixCabal :: String -> String -> String
 fixCabal name =
     unlines . reverse . go . reverse . lines
   where
-    l = "import Handler." ++ name
+    l = "                  Handler." ++ name
 
     go [] = [l]
     go (x:xs)

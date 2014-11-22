@@ -2,6 +2,8 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TypeFamilies #-}
 {-|
 Yesod.Test is a pragmatic framework for testing web applications built
 using wai and persistent.
@@ -28,7 +30,9 @@ module Yesod.Test
       yesodSpec
     , YesodSpec
     , yesodSpecWithSiteGenerator
+    , yesodSpecApp
     , YesodExample
+    , YesodExampleData(..)
     , YesodSpecTree (..)
     , ydescribe
     , yit
@@ -75,6 +79,7 @@ module Yesod.Test
     , bodyContains
     , htmlAllContain
     , htmlAnyContain
+    , htmlNoneContain
     , htmlCount
 
     -- * Grab information
@@ -92,8 +97,7 @@ module Yesod.Test
     , withResponse
     ) where
 
-import qualified Test.Hspec as Hspec
-import qualified Test.Hspec.Core as Core
+import qualified Test.Hspec.Core.Spec as Hspec
 import qualified Data.List as DL
 import qualified Data.ByteString.Char8 as BS8
 import Data.ByteString (ByteString)
@@ -124,7 +128,7 @@ import Data.Time.Clock (getCurrentTime)
 
 -- | The state used in a single test case defined using 'yit'
 --
--- Since 1.2.0
+-- Since 1.2.4
 data YesodExampleData site = YesodExampleData
     { yedApp :: !Application
     , yedSite :: !site
@@ -186,7 +190,7 @@ data RequestPart
 
 -- | The RequestBuilder state monad constructs an url encoded string of arguments
 -- to send with your requests. Some of the functions that run on it use the current
--- response to analize the forms that the server is expecting to receive.
+-- response to analyze the forms that the server is expecting to receive.
 type RequestBuilder site = ST.StateT (RequestBuilderData site) IO
 
 -- | Start describing a Tests suite keeping cookies and a reference to the tested 'Application'
@@ -199,10 +203,10 @@ yesodSpec :: YesodDispatch site
           -> YesodSpec site
           -> Hspec.Spec
 yesodSpec site yspecs =
-    Core.fromSpecList $ map unYesod $ execWriter yspecs
+    Hspec.fromSpecList $ map unYesod $ execWriter yspecs
   where
-    unYesod (YesodSpecGroup x y) = Core.SpecGroup x $ map unYesod y
-    unYesod (YesodSpecItem x y) = Core.it x $ do
+    unYesod (YesodSpecGroup x y) = Hspec.specGroup x $ map unYesod y
+    unYesod (YesodSpecItem x y) = Hspec.specItem x $ do
         app <- toWaiAppPlain site
         ST.evalStateT y YesodExampleData
             { yedApp = app
@@ -218,14 +222,33 @@ yesodSpecWithSiteGenerator :: YesodDispatch site
                            -> YesodSpec site
                            -> Hspec.Spec
 yesodSpecWithSiteGenerator getSiteAction yspecs =
-    Core.fromSpecList $ map (unYesod getSiteAction) $ execWriter yspecs
+    Hspec.fromSpecList $ map (unYesod getSiteAction) $ execWriter yspecs
     where
-      unYesod :: YesodDispatch t
-              => IO t -> YesodSpecTree t -> Core.SpecTree
-      unYesod getSiteAction' (YesodSpecGroup x y) = Core.SpecGroup x $ map (unYesod getSiteAction') y
-      unYesod getSiteAction' (YesodSpecItem x y) = Core.it x $ do
+      unYesod getSiteAction' (YesodSpecGroup x y) = Hspec.specGroup x $ map (unYesod getSiteAction') y
+      unYesod getSiteAction' (YesodSpecItem x y) = Hspec.specItem x $ do
         site <- getSiteAction'
         app <- toWaiAppPlain site
+        ST.evalStateT y YesodExampleData
+            { yedApp = app
+            , yedSite = site
+            , yedCookies = M.empty
+            , yedResponse = Nothing
+            }
+
+-- | Same as yesodSpec, but instead of taking a site it
+-- takes an action which produces the 'Application' for each test.
+-- This lets you use your middleware from makeApplication
+yesodSpecApp :: YesodDispatch site
+             => site
+             -> IO Application
+             -> YesodSpec site
+             -> Hspec.Spec
+yesodSpecApp site getApp yspecs =
+    Hspec.fromSpecList $ map unYesod $ execWriter yspecs
+  where
+    unYesod (YesodSpecGroup x y) = Hspec.specGroup x $ map unYesod y
+    unYesod (YesodSpecItem x y) = Hspec.specItem x $ do
+        app <- getApp
         ST.evalStateT y YesodExampleData
             { yedApp = app
             , yedSite = site
@@ -319,7 +342,7 @@ assertNoHeader header = withResponse $ \ SResponse { simpleHeaders = h } ->
 bodyEquals :: String -> YesodExample site ()
 bodyEquals text = withResponse $ \ res ->
   liftIO $ HUnit.assertBool ("Expected body to equal " ++ text) $
-    (simpleBody res) == BSL8.pack text
+    (simpleBody res) == encodeUtf8 (TL.pack text)
 
 -- | Assert the last response has the given text. The check is performed using the response
 -- body in full text form.
@@ -329,7 +352,7 @@ bodyContains text = withResponse $ \ res ->
     (simpleBody res) `contains` text
 
 contains :: BSL8.ByteString -> String -> Bool
-contains a b = DL.isInfixOf b (BSL8.unpack a)
+contains a b = DL.isInfixOf b (TL.unpack $ decodeUtf8 a)
 
 -- | Queries the html using a css selector, and all matched elements must contain
 -- the given string.
@@ -353,6 +376,19 @@ htmlAnyContain query search = do
     _ -> liftIO $ HUnit.assertBool ("None of "++T.unpack query++" contain "++search) $
           DL.any (DL.isInfixOf search) (map (TL.unpack . decodeUtf8) matches)
 
+-- | Queries the html using a css selector, and fails if any matched
+-- element contains the given string (in other words, it is the logical
+-- inverse of htmlAnyContains).
+--
+-- Since 1.2.2
+htmlNoneContain :: Query -> String -> YesodExample site ()
+htmlNoneContain query search = do
+  matches <- htmlQuery query
+  case DL.filter (DL.isInfixOf search) (map (TL.unpack . decodeUtf8) matches) of
+    [] -> return ()
+    found -> failure $ "Found " <> T.pack (show $ length found) <>
+                " instances of " <> T.pack search <> " in " <> query <> " elements"
+
 -- | Performs a css query on the last response and asserts the matched elements
 -- are as many as expected.
 htmlCount :: Query -> Int -> YesodExample site ()
@@ -364,7 +400,7 @@ htmlCount query count = do
 -- | Outputs the last response body to stderr (So it doesn't get captured by HSpec)
 printBody :: YesodExample site ()
 printBody = withResponse $ \ SResponse { simpleBody = b } ->
-  liftIO $ hPutStrLn stderr $ BSL8.unpack b
+  liftIO $ BSL8.hPutStrLn stderr b
 
 -- | Performs a CSS query and print the matches to stderr.
 printMatches :: Query -> YesodExample site ()
@@ -407,10 +443,10 @@ nameFromLabel label = do
       Just res -> return res
   let
     body = simpleBody res
-    mfor = parseHTML body
+    mlabel = parseHTML body
                 $// C.element "label"
                 >=> contentContains label
-                >=> attribute "for"
+    mfor = mlabel >>= attribute "for"
 
     contentContains x c
         | x `T.isInfixOf` T.concat (c $// content) = [c]
@@ -430,8 +466,11 @@ nameFromLabel label = do
             , " which was not found. "
             ]
         name:_ -> return name
-        _ -> failure $ "More than one input with id " <> for
-    [] -> failure $ "No label contained: " <> label
+        [] -> failure $ "No input with id " <> for
+    [] ->
+      case filter (/= "") $ mlabel >>= (child >=> C.element "input" >=> attribute "name") of
+        [] -> failure $ "No label contained: " <> label
+        name:_ -> return name
     _ -> failure $ "More than one label contained " <> label
 
 (<>) :: T.Text -> T.Text -> T.Text
@@ -504,7 +543,7 @@ setUrl url' = do
     let (urlPath, urlQuery) = T.break (== '?') url
     ST.modify $ \rbd -> rbd
         { rbdPath =
-            case DL.filter (/="") $ T.split (== '/') urlPath of
+            case DL.filter (/="") $ H.decodePathSegments $ TE.encodeUtf8 urlPath of
                 ("http:":_:rest) -> rest
                 ("https:":_:rest) -> rest
                 x -> x
@@ -539,7 +578,9 @@ request reqBuilder = do
       , rbdGets = []
       , rbdHeaders = []
       }
-    let path = T.cons '/' $ T.intercalate "/" rbdPath
+    let path
+            | null rbdPath = "/"
+            | otherwise = TE.decodeUtf8 $ Builder.toByteString $ H.encodePathSegments rbdPath
 
     -- expire cookies and filter them for the current path. TODO: support max age
     currentUtc <- liftIO getCurrentTime
@@ -561,7 +602,11 @@ request reqBuilder = do
     --         else makeSinglepart
     --       BinaryPostData _ -> makeSinglepart
     -- let req = maker cookiesForPath rbdPostData rbdMethod rbdHeaders path rbdGets
-    response <- liftIO $ runSession (srequest req) app
+    response <- liftIO $ runSession (srequest req
+        { simpleRequest = (simpleRequest req)
+            { httpVersion = H.http11
+            }
+        }) app
     let newCookies = map (Cookie.parseSetCookie . snd) $ DL.filter (("Set-Cookie"==) . fst) $ simpleHeaders response
         cookies' = M.fromList [(Cookie.setCookieName c, c) | c <- newCookies] `M.union` cookies
     ST.put $ YesodExampleData app site cookies' (Just response)
@@ -644,7 +689,7 @@ request reqBuilder = do
       , remoteHost = Sock.SockAddrInet 1 2
       , requestHeaders = headers ++ extraHeaders
       , rawPathInfo = TE.encodeUtf8 urlPath
-      , pathInfo = DL.filter (/="") $ T.split (== '/') urlPath
+      , pathInfo = H.decodePathSegments $ TE.encodeUtf8 urlPath
       , rawQueryString = H.renderQuery False urlQuery
       , queryString = urlQuery
       }
@@ -652,3 +697,20 @@ request reqBuilder = do
 -- Yes, just a shortcut
 failure :: (MonadIO a) => T.Text -> a b
 failure reason = (liftIO $ HUnit.assertFailure $ T.unpack reason) >> error ""
+
+instance YesodDispatch site => Hspec.Example (ST.StateT (YesodExampleData site) IO a) where
+    type Arg (ST.StateT (YesodExampleData site) IO a) = site
+
+    evaluateExample example params action =
+        Hspec.evaluateExample
+            (action $ \site -> do
+                app <- toWaiAppPlain site
+                _ <- ST.evalStateT example YesodExampleData
+                    { yedApp = app
+                    , yedSite = site
+                    , yedCookies = M.empty
+                    , yedResponse = Nothing
+                    }
+                return ())
+            params
+            ($ ())

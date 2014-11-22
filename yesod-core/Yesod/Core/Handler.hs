@@ -9,6 +9,7 @@
 {-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE DeriveDataTypeable         #-}
 ---------------------------------------------------------
 --
 -- Module        : Yesod.Handler
@@ -74,6 +75,7 @@ module Yesod.Core.Handler
     , redirect
     , redirectWith
     , redirectToPost
+    , Fragment(..)
       -- ** Errors
     , notFound
     , badMethod
@@ -89,6 +91,10 @@ module Yesod.Core.Handler
     , sendResponseStatus
     , sendResponseCreated
     , sendWaiResponse
+    , sendWaiApplication
+    , sendRawResponse
+    , sendRawResponseNoConduit
+    , notModified
       -- * Different representations
       -- $representations
     , selectRep
@@ -107,6 +113,7 @@ module Yesod.Core.Handler
     , neverExpires
     , alreadyExpired
     , expiresAt
+    , setEtag
       -- * Session
     , SessionMap
     , lookupSession
@@ -130,14 +137,17 @@ module Yesod.Core.Handler
       -- ** Hamlet
     , hamletToRepHtml
     , giveUrlRenderer
+    , withUrlRenderer
       -- ** Misc
     , newIdent
       -- * Lifting
     , handlerToIO
+    , forkHandler
       -- * i18n
     , getMessageRender
       -- * Per-request caching
     , cached
+    , cachedBy
     ) where
 
 import           Data.Time                     (UTCTime, addUTCTime,
@@ -146,18 +156,17 @@ import           Yesod.Core.Internal.Request   (langKey, mkFileInfoFile,
                                                 mkFileInfoLBS, mkFileInfoSource)
 
 import           Control.Applicative           ((<$>), (<|>))
-import           Control.Exception             (evaluate)
+import           Control.Exception             (evaluate, SomeException)
+import           Control.Exception.Lifted      (handle)
 
-import           Control.Monad                 (liftM)
+import           Control.Monad                 (liftM, void)
 import qualified Control.Monad.Trans.Writer    as Writer
 
 import           Control.Monad.IO.Class        (MonadIO, liftIO)
-import           Control.Monad.Trans.Resource  (MonadResource, liftResourceT, InternalState)
 
 import qualified Network.HTTP.Types            as H
 import qualified Network.Wai                   as W
 import Control.Monad.Trans.Class (lift)
-import Data.Conduit (transPipe, Flush (Flush), yield, Producer)
 
 import qualified Data.Text                     as T
 import           Data.Text.Encoding            (decodeUtf8With, encodeUtf8)
@@ -170,10 +179,8 @@ import qualified Data.ByteString               as S
 import qualified Data.ByteString.Lazy          as L
 import qualified Data.Map                      as Map
 
-import Data.Conduit (Source)
 import           Control.Arrow                 ((***))
 import qualified Data.ByteString.Char8         as S8
-import           Data.Maybe                    (mapMaybe)
 import           Data.Monoid                   (Endo (..), mappend, mempty)
 import           Data.Text                     (Text)
 import qualified Network.Wai.Parse             as NWP
@@ -183,21 +190,28 @@ import           Yesod.Core.Content            (ToTypedContent (..), simpleConte
 import           Yesod.Core.Internal.Util      (formatRFC1123)
 import           Text.Blaze.Html               (preEscapedToMarkup, toHtml)
 
-import           Control.Monad.Trans.Resource  (ResourceT, runResourceT, withInternalState, getInternalState, liftResourceT)
-import           Data.Dynamic                  (fromDynamic, toDyn)
 import qualified Data.IORef.Lifted             as I
-import           Data.Maybe                    (listToMaybe)
-import           Data.Typeable                 (Typeable, typeOf)
+import           Data.Maybe                    (listToMaybe, mapMaybe)
+import           Data.Typeable                 (Typeable)
+import           Web.PathPieces                (PathPiece(..))
 import           Yesod.Core.Class.Handler
 import           Yesod.Core.Types
 import           Yesod.Routes.Class            (Route)
-import Control.Failure (failure)
+import Control.Exception (throwIO)
 import Blaze.ByteString.Builder (Builder)
 import Safe (headMay)
 import Data.CaseInsensitive (CI)
-#if MIN_VERSION_wai(2, 0, 0)
+import qualified Data.Conduit.List as CL
+import Control.Monad (unless)
+import           Control.Monad.Trans.Resource  (MonadResource, InternalState, runResourceT, withInternalState, getInternalState, liftResourceT, resourceForkIO
+              )
 import qualified System.PosixCompat.Files as PC
-#endif
+import Control.Monad.Trans.Control (control, MonadBaseControl)
+import Data.Conduit (Source, transPipe, Flush (Flush), yield, Producer
+                    , Sink
+                   )
+import qualified Yesod.Core.TypeCache as Cache
+import qualified Data.Word8 as W8
 
 get :: MonadHandler m => m GHState
 get = liftHandlerT $ HandlerT $ I.readIORef . handlerState
@@ -212,7 +226,7 @@ tell :: MonadHandler m => Endo [Header] -> m ()
 tell hs = modify $ \g -> g { ghsHeaders = ghsHeaders g `mappend` hs }
 
 handlerError :: MonadHandler m => HandlerContents -> m a
-handlerError = liftHandlerT . failure
+handlerError = liftIO . throwIO
 
 hcError :: MonadHandler m => ErrorResponse -> m a
 hcError = handlerError . HCError
@@ -233,41 +247,22 @@ runRequestBody = do
         Just rbc -> return rbc
         Nothing -> do
             rr <- waiRequest
-#if MIN_VERSION_wai_extra(2, 0, 1)
             internalState <- liftResourceT getInternalState
             rbc <- liftIO $ rbHelper upload rr internalState
-#elif MIN_VERSION_wai(2, 0, 0)
-            rbc <- liftIO $ rbHelper upload rr
-#else
-            rbc <- liftResourceT $ rbHelper upload rr
-#endif
             put x { ghsRBC = Just rbc }
             return rbc
 
-#if MIN_VERSION_wai(2, 0, 0)
 rbHelper :: FileUpload -> W.Request -> InternalState -> IO RequestBodyContents
 rbHelper upload req internalState =
-#else
-rbHelper :: FileUpload -> W.Request -> ResourceT IO RequestBodyContents
-rbHelper upload req =
-#endif
     case upload of
         FileUploadMemory s -> rbHelper' s mkFileInfoLBS req
-#if MIN_VERSION_wai_extra(2, 0, 1)
         FileUploadDisk s -> rbHelper' (s internalState) mkFileInfoFile req
-#else
-        FileUploadDisk s -> rbHelper' s mkFileInfoFile req
-#endif
         FileUploadSource s -> rbHelper' s mkFileInfoSource req
 
 rbHelper' :: NWP.BackEnd x
           -> (Text -> Text -> x -> FileInfo)
           -> W.Request
-#if MIN_VERSION_wai(2, 0, 0)
           -> IO ([(Text, Text)], [(Text, FileInfo)])
-#else
-          -> ResourceT IO ([(Text, Text)], [(Text, FileInfo)])
-#endif
 rbHelper' backend mkFI req =
     (map fix1 *** mapMaybe fix2) <$> (NWP.parseRequestBody backend req)
   where
@@ -351,7 +346,7 @@ handlerToIO =
           where
             oldReq    = handlerRequest oldHandlerData
             oldWaiReq = reqWaiRequest oldReq
-            newWaiReq = oldWaiReq { W.requestBody = mempty
+            newWaiReq = oldWaiReq { W.requestBody = return mempty
                                   , W.requestBodyLength = W.KnownLength 0
                                   }
         oldEnv = handlerEnv oldHandlerData
@@ -360,6 +355,7 @@ handlerToIO =
       return $ oldState { ghsRBC = Nothing
                         , ghsIdent = 1
                         , ghsCache = mempty
+                        , ghsCacheBy = mempty
                         , ghsHeaders = mempty }
 
     -- xx From this point onwards, no references to oldHandlerData xx
@@ -382,6 +378,18 @@ handlerToIO =
                 }
         liftIO (f newHandlerData)
 
+-- | forkIO for a Handler (run an action in the background)
+--
+-- Uses 'handlerToIO', liftResourceT, and resourceForkIO
+-- for correctness and efficiency
+--
+-- Since 1.2.8
+forkHandler :: (SomeException -> HandlerT site IO ()) -- ^ error handler
+              -> HandlerT site IO ()
+              -> HandlerT site IO ()
+forkHandler onErr handler = do
+    yesRunner <- handlerToIO
+    void $ liftResourceT $ resourceForkIO $ yesRunner $ handle onErr handler
 
 -- | Redirect to the given route.
 -- HTTP status code 303 for HTTP 1.1 clients and 302 for HTTP 1.0
@@ -511,16 +519,12 @@ sendFilePart :: MonadHandler m
              -> Integer -- ^ count
              -> m a
 sendFilePart ct fp off count = do
-#if MIN_VERSION_wai(2, 0, 0)
     fs <- liftIO $ PC.getFileStatus fp
     handlerError $ HCSendFile ct fp $ Just W.FilePart
         { W.filePartOffset = off
         , W.filePartByteCount = count
         , W.filePartFileSize = fromIntegral $ PC.fileSize fs
         }
-#else
-    handlerError $ HCSendFile ct fp $ Just $ W.FilePart off count
-#endif
 
 -- | Bypass remaining handler code and output the given content with a 200
 -- status code.
@@ -546,6 +550,55 @@ sendResponseCreated url = do
 -- you don't.
 sendWaiResponse :: MonadHandler m => W.Response -> m b
 sendWaiResponse = handlerError . HCWai
+
+-- | Switch over to handling the current request with a WAI @Application@.
+--
+-- Since 1.2.17
+sendWaiApplication :: MonadHandler m => W.Application -> m b
+sendWaiApplication = handlerError . HCWaiApp
+
+-- | Send a raw response without conduit. This is used for cases such as
+-- WebSockets. Requires WAI 3.0 or later, and a web server which supports raw
+-- responses (e.g., Warp).
+--
+-- Since 1.2.16
+sendRawResponseNoConduit
+    :: (MonadHandler m, MonadBaseControl IO m)
+    => (IO S8.ByteString -> (S8.ByteString -> IO ()) -> m ())
+    -> m a
+sendRawResponseNoConduit raw = control $ \runInIO ->
+    runInIO $ sendWaiResponse $ flip W.responseRaw fallback
+    $ \src sink -> runInIO (raw src sink) >> return ()
+  where
+    fallback = W.responseLBS H.status500 [("Content-Type", "text/plain")]
+        "sendRawResponse: backend does not support raw responses"
+
+-- | Send a raw response. This is used for cases such as WebSockets. Requires
+-- WAI 2.1 or later, and a web server which supports raw responses (e.g.,
+-- Warp).
+--
+-- Since 1.2.7
+sendRawResponse :: (MonadHandler m, MonadBaseControl IO m)
+                => (Source IO S8.ByteString -> Sink S8.ByteString IO () -> m ())
+                -> m a
+sendRawResponse raw = control $ \runInIO ->
+    runInIO $ sendWaiResponse $ flip W.responseRaw fallback
+    $ \src sink -> runInIO (raw (src' src) (CL.mapM_ sink)) >> return ()
+  where
+    fallback = W.responseLBS H.status500 [("Content-Type", "text/plain")]
+        "sendRawResponse: backend does not support raw responses"
+    src' src = do
+        bs <- liftIO src
+        unless (S.null bs) $ do
+            yield bs
+            src' src
+
+-- | Send a 304 not modified response immediately. This is a short-circuiting
+-- action.
+--
+-- Since 1.4.4
+notModified :: MonadHandler m => m a
+notModified = sendWaiResponse $ W.responseBuilder H.status304 [] mempty
 
 -- | Return a 404 not found page. Also denotes no handler available.
 notFound :: MonadHandler m => m a
@@ -656,6 +709,36 @@ alreadyExpired = setHeader "Expires" "Thu, 01 Jan 1970 05:05:05 GMT"
 expiresAt :: MonadHandler m => UTCTime -> m ()
 expiresAt = setHeader "Expires" . formatRFC1123
 
+-- | Check the if-none-match header and, if it matches the given value, return
+-- a 304 not modified response. Otherwise, set the etag header to the given
+-- value.
+--
+-- Note that it is the responsibility of the caller to ensure that the provided
+-- value is a value etag value, no sanity checking is performed by this
+-- function.
+--
+-- Since 1.4.4
+setEtag :: MonadHandler m => Text -> m ()
+setEtag etag = do
+    mmatch <- lookupHeader "if-none-match"
+    let matches = maybe [] parseMatch mmatch
+    if encodeUtf8 etag `elem` matches
+        then notModified
+        else addHeader "etag" $ T.concat ["\"", etag, "\""]
+
+-- | Parse an if-none-match field according to the spec. Does not parsing on
+-- weak matches, which are not supported by setEtag.
+parseMatch :: S.ByteString -> [S.ByteString]
+parseMatch =
+    map clean . S.split W8._comma
+  where
+    clean = stripQuotes . fst . S.spanEnd W8.isSpace . S.dropWhile W8.isSpace
+
+    stripQuotes bs
+        | S.length bs >= 2 && S.head bs == W8._quotedbl && S.last bs == W8._quotedbl
+            = S.init $ S.tail bs
+        | otherwise = bs
+
 -- | Set a variable in the user's session.
 --
 -- The session is handled by the clientsession package: it sets an encrypted
@@ -715,6 +798,18 @@ instance (key ~ Text, val ~ Text) => RedirectUrl master (Route master, [(key, va
 instance (key ~ Text, val ~ Text) => RedirectUrl master (Route master, Map.Map key val) where
     toTextUrl (url, params) = toTextUrl (url, Map.toList params)
 
+-- | Add a fragment identifier to a route to be used when
+-- redirecting.  For example:
+--
+-- > redirect (NewsfeedR :#: storyId)
+--
+-- Since 1.2.9.
+data Fragment a b = a :#: b deriving (Show, Typeable)
+
+instance (RedirectUrl master a, PathPiece b) => RedirectUrl master (Fragment a b) where
+  toTextUrl (a :#: b) = (\ua -> T.concat [ua, "#", toPathPiece b]) <$> toTextUrl a
+
+
 -- | Lookup for session data.
 lookupSession :: MonadHandler m => Text -> m (Maybe Text)
 lookupSession = (liftM . fmap) (decodeUtf8With lenientDecode) . lookupSessionBS
@@ -748,7 +843,7 @@ redirectToPost :: (MonadHandler m, RedirectUrl (HandlerSite m) url)
                -> m a
 redirectToPost url = do
     urlText <- toTextUrl url
-    giveUrlRenderer [hamlet|
+    withUrlRenderer [hamlet|
 $newline never
 $doctype 5
 
@@ -764,17 +859,26 @@ $doctype 5
 
 -- | Wraps the 'Content' generated by 'hamletToContent' in a 'RepHtml'.
 hamletToRepHtml :: MonadHandler m => HtmlUrl (Route (HandlerSite m)) -> m Html
-hamletToRepHtml = giveUrlRenderer
-{-# DEPRECATED hamletToRepHtml "Use giveUrlRenderer instead" #-}
+hamletToRepHtml = withUrlRenderer
+{-# DEPRECATED hamletToRepHtml "Use withUrlRenderer instead" #-}
 
--- | Provide a URL rendering function to the given function and return the
--- result. Useful for processing Shakespearean templates.
+-- | Deprecated synonym for 'withUrlRenderer'.
 --
 -- Since 1.2.0
 giveUrlRenderer :: MonadHandler m
                 => ((Route (HandlerSite m) -> [(Text, Text)] -> Text) -> output)
                 -> m output
-giveUrlRenderer f = do
+giveUrlRenderer = withUrlRenderer
+{-# DEPRECATED giveUrlRenderer "Use withUrlRenderer instead" #-}
+
+-- | Provide a URL rendering function to the given function and return the
+-- result. Useful for processing Shakespearean templates.
+--
+-- Since 1.2.20
+withUrlRenderer :: MonadHandler m
+                => ((Route (HandlerSite m) -> [(Text, Text)] -> Text) -> output)
+                -> m output
+withUrlRenderer f = do
     render <- getUrlRenderParams
     return $ f render
 
@@ -789,34 +893,47 @@ getMessageRender = do
     l <- reqLangs `liftM` getRequest
     return $ renderMessage (rheSite env) l
 
--- | Use a per-request cache to avoid performing the same action multiple
--- times. Note that values are stored by their type. Therefore, you should use
--- newtype wrappers to distinguish logically different types.
+-- | Use a per-request cache to avoid performing the same action multiple times.
+-- Values are stored by their type, the result of typeOf from Typeable.
+-- Therefore, you should use different newtype wrappers at each cache site.
+--
+-- For example, yesod-auth uses an un-exported newtype, CachedMaybeAuth and exports functions that utilize it such as maybeAuth.
+-- This means that another module can create its own newtype wrapper to cache the same type from a different action without any cache conflicts.
+--
+-- See the original announcement: <http://www.yesodweb.com/blog/2013/03/yesod-1-2-cleaner-internals>
 --
 -- Since 1.2.0
 cached :: (MonadHandler m, Typeable a)
        => m a
        -> m a
-cached f = do
+cached action = do
     gs <- get
-    let cache = ghsCache gs
-    case clookup cache of
-        Just val -> return val
-        Nothing -> do
-            val <- f
-            put $ gs { ghsCache = cinsert val cache }
-            return val
-  where
-    clookup :: Typeable a => Cache -> Maybe a
-    clookup (Cache m) =
-        res
-      where
-        res = Map.lookup (typeOf $ fromJust res) m >>= fromDynamic
-        fromJust :: Maybe a -> a
-        fromJust = error "Yesod.Handler.cached.fromJust: Argument to typeOf was evaluated"
+    eres <- Cache.cached (ghsCache gs) action
+    case eres of
+      Right res -> return res
+      Left (newCache, res) -> do
+          put $ gs { ghsCache = newCache }
+          return res
 
-    cinsert :: Typeable a => a -> Cache -> Cache
-    cinsert v (Cache m) = Cache (Map.insert (typeOf v) (toDyn v) m)
+-- | a per-request cache. just like 'cached'.
+-- 'cached' can only cache a single value per type.
+-- 'cachedBy' stores multiple values per type by usage of a ByteString key
+--
+-- 'cached' is ideal to cache an action that has only one value of a type, such as the session's current user
+-- 'cachedBy' is required if the action has parameters and can return multiple values per type.
+-- You can turn those parameters into a ByteString cache key.
+-- For example, caching a lookup of a Link by a token where multiple token lookups might be performed.
+--
+-- Since 1.4.0
+cachedBy :: (MonadHandler m, Typeable a) => S.ByteString -> m a -> m a
+cachedBy k action = do
+    gs <- get
+    eres <- Cache.cachedBy (ghsCacheBy gs) k action
+    case eres of
+      Right res -> return res
+      Left (newCache, res) -> do
+          put $ gs { ghsCacheBy = newCache }
+          return res
 
 -- | Get the list of supported languages supplied by the user.
 --
@@ -912,8 +1029,8 @@ lookupCookies pn = do
 -- representations, e.g.:
 --
 -- > selectRep $ do
--- >   provideRep typeHtml $ produceHtmlOutput
--- >   provideRep typeJson $ produceJsonOutput
+-- >   provideRep produceHtmlOutput
+-- >   provideRep produceJsonOutput
 --
 -- The first provided representation will be used if no matches are found.
 
@@ -1010,13 +1127,12 @@ provideRepType ct handler =
 rawRequestBody :: MonadHandler m => Source m S.ByteString
 rawRequestBody = do
     req <- lift waiRequest
-    transPipe
-#if MIN_VERSION_wai(2, 0, 0)
-        liftIO
-#else
-        liftResourceT
-#endif
-        (W.requestBody req)
+    let loop = do
+            bs <- liftIO $ W.requestBody req
+            unless (S.null bs) $ do
+                yield bs
+                loop
+    loop
 
 -- | Stream the data from the file. Since Yesod 1.2, this has been generalized
 -- to work in any @MonadResource@.

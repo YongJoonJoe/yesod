@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -89,7 +90,7 @@ instance Yesod master => YesodSubDispatch EmbeddedStatic (HandlerT master IO) wh
             resp = case pathInfo req of
                             ("res":_) -> stApp site req
                             ("widget":_) -> staticApp (widgetSettings site) req
-                            _ -> return $ responseLBS status404 [] "Not Found"
+                            _ -> ($ responseLBS status404 [] "Not Found")
 
 -- | Create the haskell variable for the link to the entry
 mkRoute :: ComputedEntry -> Q [Dec]

@@ -1,3 +1,4 @@
+*~
 *.o
 *.o_p
 *.hi
@@ -10,8 +11,5 @@ yesod/foobar/
 .cabal-sandbox/
 cabal.sandbox.config
 /vendor/
-/.shelly/
-/tarballs/
-*.swp
-dist
-client_session_key.aes
+.shelly/
+tarballs/

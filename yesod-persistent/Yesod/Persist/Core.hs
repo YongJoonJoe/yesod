@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -19,23 +20,24 @@ module Yesod.Persist.Core
     ) where
 
 import Database.Persist
-import Database.Persist.Sql (SqlPersistT, unSqlPersistT)
-import Control.Monad.Trans.Reader (runReaderT)
+import Control.Monad.Trans.Reader (ReaderT, runReaderT)
 
 import Yesod.Core
 import Data.Conduit
 import Blaze.ByteString.Builder (Builder)
-import Data.IORef.Lifted
-import Data.Conduit.Pool
+import Data.Pool
 import Control.Monad.Trans.Resource
 import Control.Exception (throwIO)
 import Yesod.Core.Types (HandlerContents (HCError))
 import qualified Database.Persist.Sql as SQL
 
-type YesodDB site = YesodPersistBackend site (HandlerT site IO)
+unSqlPersistT :: a -> a
+unSqlPersistT = id
 
-class Monad (YesodPersistBackend site (HandlerT site IO)) => YesodPersist site where
-    type YesodPersistBackend site :: (* -> *) -> * -> *
+type YesodDB site = ReaderT (YesodPersistBackend site) (HandlerT site IO)
+
+class Monad (YesodDB site) => YesodPersist site where
+    type YesodPersistBackend site
     runDB :: YesodDB site a -> HandlerT site IO a
 
 -- | Helper for creating 'runDB'.
@@ -78,28 +80,27 @@ newtype DBRunner site = DBRunner
 -- | Helper for implementing 'getDBRunner'.
 --
 -- Since 1.2.0
-defaultGetDBRunner :: YesodPersistBackend site ~ SqlPersistT
+defaultGetDBRunner :: YesodPersistBackend site ~ SQL.SqlBackend
                    => (site -> Pool SQL.Connection)
                    -> HandlerT site IO (DBRunner site, HandlerT site IO ())
 defaultGetDBRunner getPool = do
-    ididSucceed <- newIORef False
-
     pool <- fmap getPool getYesod
-    managedConn <- takeResource pool
-    let conn = mrValue managedConn
+    let withPrep conn f = f conn (SQL.connPrepare conn)
+    (relKey, (conn, local)) <- allocate
+        (do
+            (conn, local) <- takeResource pool
+            withPrep conn SQL.connBegin
+            return (conn, local)
+            )
+        (\(conn, local) -> do
+            withPrep conn SQL.connRollback
+            destroyResource pool local conn)
 
-    let withPrep f = f conn (SQL.connPrepare conn)
-    (finishTransaction, ()) <- allocate (withPrep SQL.connBegin) $ \() -> do
-        didSucceed <- readIORef ididSucceed
-        withPrep $ if didSucceed
-            then SQL.connCommit
-            else SQL.connRollback
-
-    let cleanup = do
-            writeIORef ididSucceed True
-            release finishTransaction
-            mrReuse managedConn True
-            mrRelease managedConn
+    let cleanup = liftIO $ do
+            withPrep conn SQL.connCommit
+            putResource local conn
+            _ <- unprotect relKey
+            return ()
 
     return (DBRunner $ \x -> runReaderT (unSqlPersistT x) conn, cleanup)
 
@@ -123,14 +124,9 @@ respondSourceDB :: YesodPersistRunner site
 respondSourceDB ctype = respondSource ctype . runDBSource
 
 -- | Get the given entity by ID, or return a 404 not found if it doesn't exist.
-get404 :: ( PersistStore (t m)
-          , PersistEntity val
-          , Monad (t m)
-          , m ~ HandlerT site IO
-          , MonadTrans t
-          , PersistMonadBackend (t m) ~ PersistEntityBackend val
-          )
-       => Key val -> t m val
+get404 :: (MonadIO m, PersistStore (PersistEntityBackend val), PersistEntity val)
+       => Key val
+       -> ReaderT (PersistEntityBackend val) m val
 get404 key = do
     mres <- get key
     case mres of
@@ -139,14 +135,9 @@ get404 key = do
 
 -- | Get the given entity by unique key, or return a 404 not found if it doesn't
 --   exist.
-getBy404 :: ( PersistUnique (t m)
-            , PersistEntity val
-            , m ~ HandlerT site IO
-            , Monad (t m)
-            , MonadTrans t
-            , PersistEntityBackend val ~ PersistMonadBackend (t m)
-            )
-         => Unique val -> t m (Entity val)
+getBy404 :: (PersistUnique (PersistEntityBackend val), PersistEntity val, MonadIO m)
+         => Unique val
+         -> ReaderT (PersistEntityBackend val) m (Entity val)
 getBy404 key = do
     mres <- getBy key
     case mres of
@@ -157,9 +148,3 @@ getBy404 key = do
 -- GHC 7.4.2 that leads to segfaults. This is a workaround.
 notFound' :: MonadIO m => m a
 notFound' = liftIO $ throwIO $ HCError NotFound
-
-instance MonadHandler m => MonadHandler (SqlPersistT m) where
-    type HandlerSite (SqlPersistT m) = HandlerSite m
-    liftHandlerT = lift . liftHandlerT
-instance MonadWidget m => MonadWidget (SqlPersistT m) where
-    liftWidgetT = lift . liftWidgetT
